@@ -1,0 +1,205 @@
+# =============================================================================
+# Retro Box configuration
+# =============================================================================
+# Copy this file to `config.yaml` (or /etc/retrobox/config.yaml) and edit it
+# to match the folders on your drive. Validate it any time with:
+#
+#     retrobox --check
+#
+# There are two ways to define channels. Pick ONE.
+
+# -----------------------------------------------------------------------------
+# OPTION A (easiest): auto-discover channels from a media folder.
+# -----------------------------------------------------------------------------
+# Point `media_root` at a folder; every sub-folder becomes a channel, named
+# after the folder and numbered sequentially. Just drop folders in and go:
+#
+#   /media/retrobox/
+#     ├── Sitcoms/               -> channel 2 "Sitcoms"
+#     ├── Music Videos/          -> channel 3 "Music Videos"
+#     └── Talk Shows/            -> channel 4 "Talk Shows"
+#
+# media_root: /media/retrobox
+# first_channel_number: 2      # what the first discovered channel is numbered
+
+# -----------------------------------------------------------------------------
+# OPTION B (explicit): list channels yourself for full control of numbers/names.
+# -----------------------------------------------------------------------------
+channels:
+  - number: 2
+    name: "Sitcoms"
+    path: /media/retrobox/sitcoms
+
+  - number: 3
+    name: "Music Videos"
+    path: /media/retrobox/music-videos
+    # Leave out things you don't want on this channel:
+    exclude_seasons: ["6-25"]      # drop seasons 6 through 25 (detected from
+                                   #   names like S06E01, "Season 6", 6x01)
+    exclude: ["*bonus*"]           # drop any file/folder whose path matches
+    # --- Dayparting (see the block below) ---
+    # Music videos all day; after 10pm the same channel becomes something else.
+    dayparts:
+      - from: "22:00"
+        to: "02:00"
+        name: "AFTER HOURS"
+        path: /media/retrobox/late-block
+
+  - number: 4
+    name: "Talk Shows"
+    path: /media/retrobox/talk-shows
+    # Air this channel in filename order rather than on shuffle - for a serial
+    # you want to run from the start. Defaults to true (shuffled).
+    shuffle: false
+
+  - number: 5
+    name: "Infomercials"
+    path: /media/retrobox/infomercials
+    # Nothing but infomercials in the small hours - and a hard sign-off after,
+    # exactly like a station that ran out of day.
+    dayparts:
+      - from: "05:00"
+        to: "18:00"
+        off_air: true
+
+  - number: 6
+    name: "Movies"
+    path: /media/retrobox/movies
+
+# -----------------------------------------------------------------------------
+# Dayparting: channels that change with the clock.
+# -----------------------------------------------------------------------------
+# Each entry under a channel's `dayparts:` is a wall-clock window that can:
+#   name:     rename the channel while the window is open
+#   path:     swap in a different folder of programming
+#   off_air:  take the channel off the air (colour bars, no programme)
+#
+# Windows use 24-hour local time and may wrap past midnight ("22:00" -> "02:00"
+# is the obvious late-night case). They are tested in the order you write them,
+# so the first matching window wins. Outside every window the channel falls back
+# to its own name and folder. A daypart with a `name` but no `path` just renames
+# the channel and keeps the same shuffle running - the running order does not
+# restart at 10pm. `off_air` and `path` are mutually exclusive.
+
+# -----------------------------------------------------------------------------
+# How a channel behaves when you tune into it.
+#   random    - start a fresh random episode (the classic "flip and something is
+#               on"); it starts a few seconds in (see start_offset), then keeps
+#               rolling on shuffle.  [default]
+#   resume    - pick up where you left off on that channel last time.
+#   broadcast - the channel runs like a real always-on station: it advances in
+#               real time even while you're watching something else, so you tune
+#               in partway through whatever "would" be airing. (Needs ffprobe.)
+# -----------------------------------------------------------------------------
+tune_in: random
+
+start_channel: 2          # which channel the box powers on to
+
+# --- Boot splash -------------------------------------------------------------
+# A clip played once at start-up, before the first channel is tuned. Unset by
+# default. A bare filename is looked for in the assets folder, so this finds the
+# bundled JV Projects splash; an absolute path works too. Any button press skips
+# it, and a missing file is skipped with a warning rather than being an error.
+# boot_splash: boot_splash.mp4
+
+# --- Station bumpers ---------------------------------------------------------
+# A folder of short clips - idents, "we'll be right back", station promos - that
+# play between episodes and stitch the night together. Leave it unset for none.
+# bumpers: /media/retrobox/bumpers
+bumper_chance: 1.0        # 0-1: how often a bumper airs between episodes
+bumper_max_seconds: 30    # hard cap, so one stray long file can't stall the box
+
+# --- Sleep timer -------------------------------------------------------------
+# The sleep button cycles through these durations (minutes) and then back to
+# off. Set `sleep_timer: false` to disable the button entirely.
+sleep_timer: [30, 60, 90]
+# What happens when it runs out:
+#   standby - blank the screen, leave the box running (press power to wake)
+#   off     - shut the machine down cleanly, so it's safe to unplug
+sleep_action: standby
+
+# --- The "feel" of the TV ----------------------------------------------------
+# Shows keep their own aspect ratio (4:3 is pillar-boxed, 16:9 fills the screen)
+# and get the CRT curve/rounding. Set force_4_3:true to instead letterbox every
+# show into a single 4:3 frame.
+force_4_3: false
+
+# Start each episode a random number of seconds in, between these two values, so
+# channel switches land at varied points in the show (skips the black leader/
+# intro too). Use a single number for a fixed offset, e.g. `start_offset: 5`.
+# Set 0 if you genuinely want everything from the top.
+start_offset: [6, 10]
+
+# Channel-change effect: "none" (default), "glitch" (brief digital corruption),
+# or "static" (analog snow).
+transition: none
+transition_duration: 0.4  # how long the effect shows (if not "none")
+
+# With transition "none", keep the current show playing this many seconds while
+# the next channel loads in the background, then cut over - so the picture never
+# freezes on a channel change. 0 = switch immediately.
+bridge_seconds: 0.8
+channel_bug_seconds: 4    # how long the channel banner lingers
+osd_duration: 2           # how long the volume bar / messages linger
+guide_seconds: 8          # how long the on-screen channel guide stays up
+
+# --- On-screen display look (the green digital readouts) ---------------------
+ui:
+  font: "VT323"           # bundled retro terminal font (installed by install.sh)
+  color: "#4DFF5A"        # phosphor green for CH banner, volume bar, guide
+  dim_color: "#123B18"    # unlit volume dots (the segments not yet filled)
+  glow: true              # soft CRT-style glow around the text
+
+# --- CRT picture effect (for 4:3 shows on a flat TV) -------------------------
+# Bends the picture like a tube TV: a gentle bulge, rounded corners, a vignette
+# and faint scanlines. Set enabled:false if the box struggles or you dislike it.
+crt:
+  enabled: true
+  curvature: 0.12         # 0 = flat, ~0.2 = strongly bulged
+  corner_radius: 0.065    # how rounded the corners are
+  vignette: 0.25          # edge darkening (0-1)
+  scanlines: true
+  scanline_intensity: 0.12
+
+# --- Audio -------------------------------------------------------------------
+initial_volume: 70        # 0-100
+volume_step: 5            # how much each volume press changes it
+# Force audio to a specific output - for a TV you want HDMI, not the analog
+# jack. Run `retrobox --list-audio` to see the names. On Intel machines the
+# HDMI outputs hang off the onboard HDA controller, so the card is usually PCH.
+# audio_device: "alsa/hdmi:CARD=PCH,DEV=0"   # try other DEV= for other ports
+
+# Pressing volume-down once more when already at 0 cleanly shuts the machine
+# down (needs the sudo rule from scripts/install-service.sh).
+power_off_on_min_volume: true
+# power_off_command: ["sudo", "poweroff"]   # override the shutdown command
+
+# --- Playback ----------------------------------------------------------------
+scan_recursive: true      # also look inside season sub-folders for episodes
+# video_extensions: [".mp4", ".mkv", ".avi", ".m4v"]   # override if needed
+# shuffle_seed: 1234       # set for a repeatable shuffle order (mostly for tests)
+
+# --- Remote control input ----------------------------------------------------
+# All backends are auto-detected; anything unavailable is skipped, so these are
+# only needed to turn things off or fine-tune device selection.
+input:
+  keyboard: true          # USB/IR remotes & keyboards (via Linux evdev)
+  cec: true               # the TV's own remote over HDMI-CEC (needs cec-utils)
+  stdin: false            # developer keyboard over the terminal
+  # keyboard_name_filter: "remote"   # only listen to devices whose name matches
+  # keyboard_devices: ["/dev/input/event0"]  # or pin exact devices
+  # keyboard_grab: false             # true = stop keystrokes leaking to console
+
+  # Map specific keys to actions (handy for odd remotes). Find a button's key
+  # name with `sudo evtest`. Actions: channel_up, channel_down, volume_up,
+  # volume_down, mute, enter, info, guide, sleep, last_channel, power, quit,
+  # digit_0..digit_9, or none (to unbind). Example for a Logitech R400
+  # presenter. NOTE: its play-screen button sends Escape, which opens the
+  # menu, so remap KEY_ESC if you would rather it did something else.
+  # key_overrides:
+  #   KEY_PAGEUP: channel_down    # left  (<) arrow
+  #   KEY_PAGEDOWN: channel_up    # right (>) arrow
+  #   KEY_ESC: volume_down        # play-screen button (sends Esc)
+  #   KEY_F5: volume_down         #   ...and sometimes F5 - map both
+  #   KEY_DOT: volume_up          # blank-screen button
+  #   KEY_B: volume_up            #   ...blank button alt code - map both

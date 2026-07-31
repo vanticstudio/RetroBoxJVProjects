@@ -1,0 +1,19 @@
+# Retro Box dependencies.
+#
+# Prefer installing the package itself rather than this file - it is kept only
+# for tools that expect a requirements.txt:
+#
+#     pip install -e .              # core only (any OS, enough to run the tests)
+#     pip install -e ".[hardware]"  # + video playback and remote input, on the box
+#     pip install -e ".[dev]"       # + pytest
+#
+# Core dependency, needed everywhere.
+PyYAML>=6.0
+
+# --- On-the-box runtime dependencies -----------------------------------------
+# Required to actually play video and read the remote. They are commented out
+# because they bind to system libraries (libmpv, libevdev) that must be present
+# first - scripts/install.sh installs those, then `pip install -e ".[hardware]"`.
+#
+# python-mpv>=1.0.5   # bindings to libmpv for hardware-accelerated playback
+# evdev>=1.6.1        # reads USB/IR remotes exposed as Linux input devices

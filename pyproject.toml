@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retrobox"
+version = "1.0.0"
+description = "A retro TV media player for a small Linux box - fixed channels, shuffled episodes, dayparting, station bumpers and a sleep timer, with an authentic late-night cable feel."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "JV Projects" }]
+keywords = ["media-player", "retro-tv", "mpv", "nostalgia", "crt", "iptv", "htpc"]
+
+# Core runtime dependency. The hardware-specific dependencies (python-mpv,
+# evdev) live in the optional "hardware" extra so the pure logic can be
+# developed and tested on any machine, including macOS and Windows.
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# Everything needed to actually drive a TV from the box itself. Both wrap
+# system libraries (libmpv, libevdev) that scripts/install.sh installs first.
+hardware = [
+    "python-mpv>=1.0.5",
+    "evdev>=1.6.1",
+]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+retrobox = "retrobox.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["retrobox*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,46 @@
+# systemd unit template for Retro Box.
+#
+# This is a TEMPLATE - scripts/install-service.sh fills in the real user, group,
+# home and paths and installs it to /etc/systemd/system/retrobox.service.
+# You can also copy/edit it by hand.
+#
+# It starts the TV directly on the console (no desktop needed): mpv renders via
+# the KMS/DRM video output straight to the HDMI display.
+
+[Unit]
+Description=Retro Box retro TV
+After=multi-user.target sound.target
+Conflicts=getty@tty1.service
+# If it dies 5 times inside a minute something is genuinely broken (a bad
+# config, a missing drive) and restarting forever just hides it in the logs.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+# Access to the framebuffer/GPU, input devices and audio.
+SupplementaryGroups=video render input audio tty
+WorkingDirectory=__REPO_DIR__
+Environment=HOME=__HOME__
+# Render straight to the console/HDMI via KMS-DRM.
+Environment=XDG_RUNTIME_DIR=/run/user/__UID__
+ExecStart=__REPO_DIR__/.venv/bin/retrobox --config __REPO_DIR__/config.yaml
+# on-failure, not always: a crashed mpv or an unreadable file brings the box
+# straight back without anyone having to SSH in, but a deliberate quit (exit 0)
+# stays quit instead of instantly relaunching under you.
+Restart=on-failure
+RestartSec=3
+# Exit code 3 means "the viewer asked to power the machine off" (volume-down
+# past zero, or the sleep timer with sleep_action: off). That is a non-zero
+# exit, so without this on-failure would relaunch the TV mid-shutdown.
+RestartPreventExitStatus=3
+# Own the console so video can be shown on it.
+StandardInput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+
+[Install]
+WantedBy=multi-user.target
