@@ -40,6 +40,18 @@ sudo chmod 440 /etc/sudoers.d/retrobox-poweroff
 
 echo "==> Enabling and starting the service"
 sudo systemctl daemon-reload
+# The web dashboard is a second unit alongside the TV.
+if [[ -f "${REPO_DIR}/scripts/retrobox-web.service" ]]; then
+  sed -e "s|__USER__|${RUN_USER}|g" -e "s|__UID__|${RUN_UID}|g" \
+      -e "s|__HOME__|${RUN_HOME}|g" -e "s|__REPO_DIR__|${REPO_DIR}|g" \
+      "${REPO_DIR}/scripts/retrobox-web.service" \
+    | sudo tee /etc/systemd/system/retrobox-web.service > /dev/null
+  sudo systemctl daemon-reload
+  sudo systemctl enable retrobox-web.service
+  sudo systemctl restart retrobox-web.service
+  echo "==> Web dashboard enabled on port 8080"
+fi
+
 sudo systemctl enable retrobox.service
 sudo systemctl restart retrobox.service
 

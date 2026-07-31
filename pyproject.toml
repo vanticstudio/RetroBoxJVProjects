@@ -26,12 +26,19 @@ hardware = [
     "python-mpv>=1.0.5",
     "evdev>=1.6.1",
 ]
+# The LAN web dashboard. Separate from `hardware` because it runs as its
+# own service and a box without it is perfectly usable.
+web = [
+    "Flask>=3.0",
+]
 dev = [
     "pytest>=7.0",
+    "Flask>=3.0",
 ]
 
 [project.scripts]
 retrobox = "retrobox.__main__:main"
+retrobox-web = "retrobox.webui:main"
 
 [tool.setuptools.packages.find]
 include = ["retrobox*"]

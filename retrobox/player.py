@@ -49,6 +49,10 @@ class Player(ABC):
     def set_mouse_enabled(self, enabled: bool) -> None:
         """Start/stop reporting pointer activity. Default: nothing to do."""
 
+    def get_hwdec(self) -> Optional[str]:
+        """The decoder actually in use, e.g. "vaapi", or None for software."""
+        return None
+
     def get_mouse_position(self) -> Optional[Tuple[float, float]]:
         """Pointer position as (x, y) fractions of the video surface.
 
@@ -414,6 +418,16 @@ class MpvPlayer(Player):
         if position is not None and self.on_click is not None:
             self.on_click(position)
 
+    def get_hwdec(self) -> Optional[str]:
+        try:
+            current = self._mpv.hwdec_current
+        except Exception:  # noqa: BLE001
+            return None
+        # mpv reports the string 'no' when it fell back to software.
+        if not current or str(current) in ('no', 'none'):
+            return None
+        return str(current)
+
     def get_mouse_position(self) -> Optional[Tuple[float, float]]:
         try:
             pos = self._mpv.mouse_pos
@@ -459,6 +473,7 @@ class MockPlayer(Player):
         self.paused = False
         self.audio_device: Optional[str] = None
         self.mouse_enabled = False
+        self.hwdec: Optional[str] = None
         #: Tests set this to a normalised (x, y) to simulate a pointer.
         self.mouse_position: Optional[Tuple[float, float]] = None
 
@@ -474,6 +489,9 @@ class MockPlayer(Player):
     def set_mouse_enabled(self, enabled: bool) -> None:
         self.mouse_enabled = bool(enabled)
         self._log(f"MOUSE {'ON' if enabled else 'OFF'}")
+
+    def get_hwdec(self) -> Optional[str]:
+        return self.hwdec
 
     def get_mouse_position(self) -> Optional[Tuple[float, float]]:
         return self.mouse_position if self.mouse_enabled else None

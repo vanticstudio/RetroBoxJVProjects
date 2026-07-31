@@ -29,6 +29,7 @@ class Action(Enum):
     MENU = auto()           # toggle the on-screen settings menu
     LAST_CHANNEL = auto()   # jump back to the previously watched channel
     SLEEP = auto()          # cycle the sleep timer (30 -> 60 -> 90 -> off)
+    SHUTDOWN = auto()       # shut the machine down cleanly (menu / dashboard)
     POWER = auto()          # toggle standby (blank screen)
     QUIT = auto()           # shut the application down entirely
 

@@ -65,6 +65,7 @@ def create_backends(options: Optional[Dict] = None) -> List[InputBackend]:
         keyboard: true            # evdev USB/IR remote & keyboard input
         cec: true                 # HDMI-CEC (TV remote)
         stdin: false              # developer terminal input
+        web: true                 # local socket for the web dashboard
         keyboard_devices: [/dev/input/event0, ...]
         keyboard_name_filter: "remote"
         keyboard_grab: false
@@ -97,6 +98,14 @@ def create_backends(options: Optional[Dict] = None) -> List[InputBackend]:
             )
         else:
             log.info("evdev not available; skipping keyboard backend")
+
+    if options.get("web", True):
+        from .web import WebBackend
+
+        if WebBackend.is_available():
+            backends.append(WebBackend(options.get("web_socket")))
+        else:
+            log.info("no AF_UNIX support; skipping web control backend")
 
     if options.get("cec", True):
         from .cec import CecBackend

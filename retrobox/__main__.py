@@ -212,6 +212,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.error("%s", exc)
         return 2
 
+    # Fold in any new folders under media_root before anything reads the
+    # lineup, so --check and the TV itself see exactly the same channels.
+    from .autochannels import apply_auto_channels
+
+    config, added = apply_auto_channels(config, config_path)
+    if added:
+        log.info(
+            "auto_channels: added %d channel(s): %s",
+            len(added), ", ".join(f"{c.number} {c.name}" for c in added),
+        )
+
     if args.check:
         return _cmd_check(config)
 

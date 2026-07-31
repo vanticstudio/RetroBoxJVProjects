@@ -32,6 +32,7 @@ from .input.manager import InputManager, create_backends
 from .menu import MenuContext, MenuModel
 from .overlay import CANVAS_H, CANVAS_W, GuideEntry, OverlayManager, menu_row_at
 from .player import END_EOF, END_ERROR, MockPlayer, Player
+from .status import write_status
 from .playlist import ShuffleBag
 from .static_gen import (
     COLORBARS_FILENAME,
@@ -64,6 +65,9 @@ _MENU_KEYS = (
 # truncated or unplayable file), give up after this long and start the TV
 # anyway rather than sitting on a dead screen forever.
 _SPLASH_TIMEOUT_SECONDS = 30.0
+
+# How often the status snapshot the web dashboard reads is refreshed.
+_STATUS_INTERVAL_SECONDS = 2.0
 
 
 class TVApp:
@@ -125,6 +129,10 @@ class TVApp:
         # Last observed daypart state of the current channel, so a window
         # opening or closing under us is noticed rather than waited out.
         self._daypart_marker: Optional[tuple] = None
+
+        # Status snapshot for the web dashboard.
+        self._status_due = 0.0
+        self._started_at = self._clock()
 
         # Station bumpers played between episodes.
         self._bumper_rng = random.Random(config.shuffle_seed)
@@ -289,6 +297,7 @@ class TVApp:
         self._maybe_retune_daypart()
         self._drain_clicks()
         self._track_pointer()
+        self._maybe_write_status(now)
         self._drain_playback_events()
 
         event = self.input.get(timeout=timeout if block else 0.0)
@@ -311,6 +320,10 @@ class TVApp:
 
         if action == Action.QUIT:
             self._running = False
+            return
+        if action == Action.SHUTDOWN:
+            self.close_menu()
+            self._power_off()
             return
 
         # Any other button cuts the boot splash short and starts the TV. The
@@ -725,6 +738,39 @@ class TVApp:
             # Only the station ident changed - keep playing, reflash the bug.
             self.overlay.show_channel_bug(channel.number, name)
 
+    # -- status snapshot ----------------------------------------------------
+    def build_status(self) -> dict:
+        """A cheap snapshot of what the box is doing, for the dashboard."""
+        channel = self.lineup.current
+        now = self._wall_clock()
+        remaining = self.sleep_remaining()
+        return {
+            "version": _version(),
+            "uptime_seconds": round(self._clock() - self._started_at, 1),
+            "channel": {"number": channel.number, "name": channel.name_at(now)},
+            "now_playing": (
+                _episode_title(self._playing_path) if self._playing_path else ""
+            ),
+            "off_air": channel.is_off_air(now),
+            "volume": self.volume,
+            "muted": self.muted,
+            "standby": self.standby,
+            "menu_open": self._menu is not None,
+            "audio_device": self._audio_device,
+            "hwdec": self.player.get_hwdec(),
+            "sleep_minutes": (
+                None if remaining is None
+                else int(remaining // 60) + (1 if remaining % 60 else 0)
+            ),
+            "channel_count": len(self.lineup),
+        }
+
+    def _maybe_write_status(self, now: float) -> None:
+        if now < self._status_due:
+            return
+        self._status_due = now + _STATUS_INTERVAL_SECONDS
+        write_status(self.build_status())
+
     # -- on-screen menu -----------------------------------------------------
     def _menu_context(self) -> MenuContext:
         """Snapshot the state the menu renders from."""
@@ -959,6 +1005,12 @@ class TVApp:
             return None
         filename = GLITCH_FILENAME if effect == "glitch" else STATIC_FILENAME
         return self._resolve_asset(filename)
+
+
+def _version() -> str:
+    from . import __version__
+
+    return __version__
 
 
 def _episode_title(path: Path) -> str:

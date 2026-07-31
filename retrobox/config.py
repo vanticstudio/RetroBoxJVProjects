@@ -147,6 +147,15 @@ class Config:
     bumper_chance: float = 1.0            # 0..1 probability per episode change
     bumper_max_seconds: float = 30.0      # hard cap so a stray long file can't stall
 
+    # Where channel folders live. Kept on the config (not just used during
+    # parsing) because auto_channels rescans it at every start-up.
+    media_root: Optional[Path] = None
+    first_channel_number: int = 2
+    # Turn any new top-level folder under media_root into a channel on start-up
+    # and remember it in config.yaml. Off by default: with it off, the lineup is
+    # exactly what you or `retrobox --setup` put there.
+    auto_channels: bool = False
+
     # Playback.
     scan_recursive: bool = True           # look in sub-folders for episodes
     shuffle_seed: Optional[int] = None    # set for deterministic ordering (tests)
@@ -359,13 +368,14 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
 
     media_root_raw = data.get("media_root")
     media_root = _as_path(media_root_raw, base_dir) if media_root_raw else None
+    first_channel_number = int(data.get("first_channel_number", 2))
 
     if "channels" in data:
         channels = _parse_channels(data["channels"], media_root or base_dir, default_shuffle)
     elif media_root is not None:
         channels = _discover_channels(
             media_root,
-            start_number=int(data.get("first_channel_number", 2)),
+            start_number=first_channel_number,
             default_shuffle=default_shuffle,
         )
     else:
@@ -444,6 +454,9 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
         shuffle_seed=(int(data["shuffle_seed"]) if data.get("shuffle_seed") is not None else None),
         assets_dir=assets_dir,
         boot_splash=boot_splash,
+        media_root=media_root,
+        first_channel_number=first_channel_number,
+        auto_channels=bool(data.get("auto_channels", False)),
         input_options=dict(data.get("input") or {}),
     )
 

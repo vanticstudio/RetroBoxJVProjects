@@ -429,6 +429,30 @@ scanned from, so `retrobox --check` picks it up immediately.
 > library. That's the right trade on a home LAN; don't do it on a network you
 > don't control.
 >
+## The web dashboard
+
+The installer also puts a small dashboard on the box. Point any browser on the
+network at it:
+
+```
+http://retrobox:8080/      (or http://<box-ip>:8080/)
+```
+
+You get what's playing now, the channel list with jump-to-channel, volume and
+mute, standby, and a shutdown button — the same things the on-screen menu does,
+in the same phosphor green, for when the remote is under a cushion.
+
+It runs as its own service (`systemctl status retrobox-web`) and never touches
+the running player: the TV writes a small status file every couple of seconds,
+and the dashboard sends button presses back over a local socket that arrive as
+ordinary remote events. If the TV process is stopped, the page says so rather
+than lying to you.
+
+> **Like the file share, there is no login.** Anyone who can reach the box on
+> the network can change the channel or shut it down. Same trade, same caveat:
+> fine on a home LAN, wrong anywhere you don't control. To turn it off:
+> `sudo systemctl disable --now retrobox-web`.
+
 > If the box never appears under **Network**, that's the discovery service, not
 > the share: modern Windows dropped the old SMB1 browsing this used to rely on,
 > so `wsdd` advertises the box instead. Typing `\\<box-ip>\Library` into the

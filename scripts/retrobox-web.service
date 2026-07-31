@@ -1,0 +1,27 @@
+# systemd unit template for the Retro Box web dashboard.
+#
+# A TEMPLATE - scripts/install-service.sh fills in the real user and paths.
+#
+# Runs as a separate process from the TV itself. It never touches the player:
+# it reads the status file the TV writes and sends commands back over a local
+# socket, which the TV's `web` input backend turns into ordinary remote events.
+
+[Unit]
+Description=Retro Box web dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=__REPO_DIR__
+Environment=HOME=__HOME__
+# Must match the TV's, or the two won't find the same status file and socket.
+Environment=XDG_RUNTIME_DIR=/run/user/__UID__
+ExecStart=__REPO_DIR__/.venv/bin/retrobox-web --config __REPO_DIR__/config.yaml --port 8080
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

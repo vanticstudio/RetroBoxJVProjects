@@ -203,3 +203,17 @@ input:
   #   KEY_F5: volume_down         #   ...and sometimes F5 - map both
   #   KEY_DOT: volume_up          # blank-screen button
   #   KEY_B: volume_up            #   ...blank button alt code - map both
+
+# --- Automatic channels -------------------------------------------------------
+# With this on, every top-level folder under media_root that isn't already a
+# channel becomes one at start-up: next free number, folder name tidied up for
+# the on-screen name. New channels are written back into this file so they
+# persist and show up in `retrobox --check`.
+#
+# It is purely additive - a folder that already has a channel is left alone, so
+# names and numbers you set by hand (or with `retrobox --setup`) are never
+# overwritten. Folders with no video files in them are skipped.
+#
+# Needs media_root set. Off by default.
+# media_root: /media/retrobox
+# auto_channels: true

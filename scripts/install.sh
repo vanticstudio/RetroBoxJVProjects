@@ -90,7 +90,7 @@ echo "==> Installing Retro Box and Python dependencies"
 pip install --upgrade pip
 # Editable install so that updating the code needs no reinstall (just restart
 # the service afterwards).
-pip install -e "${REPO_DIR}[hardware]"
+pip install -e "${REPO_DIR}[hardware,web]"
 
 if [[ "${PLATFORM}" == "pc" ]]; then
   echo "==> Detecting graphics and HDMI audio hardware"
