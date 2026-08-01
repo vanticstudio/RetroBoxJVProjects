@@ -229,7 +229,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     from .app import run_from_config
 
     try:
-        return run_from_config(config, dry_run=args.dry_run)
+        return run_from_config(config, dry_run=args.dry_run, config_path=config_path)
     except RuntimeError as exc:
         log.error("%s", exc)
         return 1

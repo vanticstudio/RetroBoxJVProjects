@@ -104,6 +104,98 @@ else
   echo "==> Skipping VA-API setup (the Pi decodes through V4L2, not VA-API)"
 fi
 
+# --- Reachable by name -------------------------------------------------------
+# So the customer types http://retrobox.local and not an IP address they had to
+# find first. mDNS is the only name resolution that works out of the box across
+# macOS, iOS, Android and Windows 10+ without the router having to cooperate.
+#
+# Deliberately BEFORE the file share below: that script reads $(hostname) to
+# name the share and to print how to reach it, so the rename has to have
+# happened first or the two disagree about what the box is called.
+#
+# Bare "retrobox" with no suffix only works when the router registers DHCP
+# hostnames into its own DNS. Plenty do; plenty do not. It is a bonus, never
+# the documented address.
+echo "==> Setting up mDNS so the box answers to retrobox.local"
+if have_package avahi-daemon; then
+  sudo apt-get install -y avahi-daemon avahi-utils || \
+    echo "   (avahi install failed - the box is still reachable by IP)"
+else
+  echo "   (no avahi-daemon package on this distro - the box stays reachable by IP)"
+fi
+
+# The mDNS name follows the system hostname, so retrobox.local needs the
+# hostname to actually be "retrobox". The installer sets it rather than telling
+# people to, because getting it wrong means the documented URL does not work.
+CURRENT_HOSTNAME="$(hostname)"
+if [[ "${CURRENT_HOSTNAME}" != "retrobox" ]]; then
+  echo "==> Hostname is '${CURRENT_HOSTNAME}'; setting it to 'retrobox'"
+  sudo hostnamectl set-hostname retrobox 2>/dev/null || \
+    echo "   (could not set the hostname - the box will answer to ${CURRENT_HOSTNAME}.local)"
+  # /etc/hosts must follow, or sudo pauses on every command trying to resolve
+  # a hostname that no longer has a loopback entry.
+  if ! grep -qE "^127\.0\.1\.1[[:space:]]+retrobox" /etc/hosts 2>/dev/null; then
+    if grep -qE "^127\.0\.1\.1" /etc/hosts 2>/dev/null; then
+      sudo sed -i -E "s|^127\.0\.1\.1.*|127.0.1.1\tretrobox|" /etc/hosts || true
+    else
+      printf '127.0.1.1\tretrobox\n' | sudo tee -a /etc/hosts > /dev/null || true
+    fi
+  fi
+fi
+
+if systemctl list-unit-files 2>/dev/null | grep -q "^avahi-daemon\.service"; then
+  # systemd-resolved also speaks mDNS on some images. Two responders on UDP
+  # 5353 answer the same query twice, which shows up as a box that resolves
+  # intermittently. Avahi is the one Samba and the rest of the desktop world
+  # integrate with, so it wins and resolved's copy is turned off.
+  if [[ -f /etc/systemd/resolved.conf ]] && \
+     systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    if resolvectl mdns 2>/dev/null | grep -qi "yes"; then
+      echo "==> Turning off systemd-resolved's mDNS (avahi is answering instead)"
+      sudo sed -i -E 's|^#?MulticastDNS=.*|MulticastDNS=no|' /etc/systemd/resolved.conf || true
+      grep -q "^MulticastDNS=" /etc/systemd/resolved.conf 2>/dev/null || \
+        echo "MulticastDNS=no" | sudo tee -a /etc/systemd/resolved.conf > /dev/null
+      sudo systemctl restart systemd-resolved || true
+    fi
+  fi
+  # Avahi answers on every interface that is up and follows them appearing and
+  # disappearing, so unplugging the ethernet and joining wifi keeps
+  # retrobox.local working. That is the DEFAULT, not something we configure -
+  # but it stops being true the moment somebody pins the interface list, and
+  # then the documented address silently dies on a box that changed network.
+  # So check rather than assume, and say so rather than quietly overriding a
+  # choice somebody may have made deliberately.
+  AVAHI_CONF=/etc/avahi/avahi-daemon.conf
+  if [[ -f "${AVAHI_CONF}" ]] && \
+     grep -qE '^[[:space:]]*(allow|deny)-interfaces[[:space:]]*=' "${AVAHI_CONF}"; then
+    echo "!! ${AVAHI_CONF} pins which interfaces mDNS uses:"
+    grep -E '^[[:space:]]*(allow|deny)-interfaces[[:space:]]*=' "${AVAHI_CONF}" | sed 's/^/     /'
+    echo "   retrobox.local will stop resolving if the box moves to an interface"
+    echo "   that is not listed. Comment those lines out to answer on all of them."
+  fi
+
+  # Enabled, not started-and-waited-for: if the box boots with no network at
+  # all, nothing here may hold up the television.
+  sudo systemctl enable avahi-daemon 2>/dev/null || true
+  # Restart rather than start: on a re-run avahi is already up, and `start` on
+  # a running unit does nothing - it would keep announcing the old hostname.
+  sudo systemctl restart avahi-daemon 2>/dev/null || \
+    echo "   (avahi did not start - no network yet? it will come up on boot)"
+
+  # Confirm the name actually resolves rather than declaring victory. Needs a
+  # network to succeed, so a failure here is reported, never fatal.
+  if command -v avahi-resolve > /dev/null 2>&1; then
+    if avahi-resolve -4 -n retrobox.local > /dev/null 2>&1; then
+      echo "==> mDNS ready: retrobox.local resolves"
+    else
+      echo "==> mDNS enabled. retrobox.local did not resolve yet - normal if the"
+      echo "    network is still coming up; it will answer once an interface is up."
+    fi
+  else
+    echo "==> mDNS ready: the box should answer to retrobox.local"
+  fi
+fi
+
 if [[ "${SETUP_SHARE}" -eq 1 ]]; then
   echo "==> Setting up the LAN file share"
   # Every unit wants this, so it is part of the standard flow rather than a

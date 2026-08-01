@@ -14,7 +14,9 @@ Newly found channels are written back into config.yaml so they persist and turn
 up in ``retrobox --check``. That write is surgical: the new entries are spliced
 into the existing ``channels:`` block and the rest of the file - comments and
 all - is left byte-for-byte intact, because round-tripping YAML through a dumper
-would throw away every comment in the example config.
+would throw away every comment in the example config. It also goes through
+:mod:`retrobox.configwrite`, so a power cut mid-write cannot leave the box with
+a truncated config it will not boot from.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from .channel import scan_episodes
 from .config import ChannelConfig, Config, _prettify_name
+from .configwrite import write_config_text
 
 log = logging.getLogger(__name__)
 
@@ -142,7 +145,9 @@ def write_channels(config_path: Path, channels: Sequence[ChannelConfig]) -> None
         insert_at = len(lines)
 
     lines[insert_at:insert_at] = block
-    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Never a plain write_text: that truncates the user's config the instant it
+    # opens it, and this box gets switched off at the wall. See configwrite.
+    write_config_text(config_path, "\n".join(lines) + "\n")
 
 
 def _end_of_channels_block(lines: List[str]) -> Optional[int]:

@@ -110,6 +110,11 @@ class OverlayManager:
         self._menu_visible = False
 
     # -- public API ---------------------------------------------------------
+    def use_config(self, config: Config) -> None:
+        """Adopt a reloaded config, so overlay timings and colours follow it."""
+        self._config = config
+        self._ui = config.ui
+
     def show_channel_bug(
         self, number: int, name: str, *, duration: Optional[float] = None
     ) -> None:

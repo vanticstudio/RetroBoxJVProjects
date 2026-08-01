@@ -27,7 +27,7 @@ from typing import Callable, List, Optional
 
 from .actions import Action, InputEvent
 from .channel import Channel, ChannelLineup, PlayRequest, build_lineup, scan_episodes
-from .config import Config
+from .config import POWER_OFF_COMMANDS, Config, ConfigError, load_config
 from .input.manager import InputManager, create_backends
 from .menu import MenuContext, MenuModel
 from .overlay import CANVAS_H, CANVAS_W, GuideEntry, OverlayManager, menu_row_at
@@ -83,8 +83,14 @@ class TVApp:
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         assets_dir: Optional[Path] = None,
+        config_path: Optional[Path] = None,
     ) -> None:
         self.config = config
+        # Where the config came from, so a `reload` command can go and read it
+        # again. None when the app was built straight from a Config object
+        # (the tests, and anything embedding it), in which case reload is a
+        # no-op rather than a guess at which file was meant.
+        self._config_path = Path(config_path) if config_path else None
         self.player = player
         self.input = input_manager
         self.overlay = overlay or OverlayManager(player, config, clock=clock)
@@ -170,6 +176,7 @@ class TVApp:
         input_manager: Optional[InputManager] = None,
         dry_run: bool = False,
         assets_dir: Optional[Path] = None,
+        config_path: Optional[Path] = None,
     ) -> "TVApp":
         """Build a fully wired app, creating real hardware backends by default.
 
@@ -200,7 +207,10 @@ class TVApp:
                 backends = create_backends(config.input_options)
             input_manager = InputManager(backends)
 
-        return cls(config, player, input_manager, assets_dir=assets_dir)
+        return cls(
+            config, player, input_manager,
+            assets_dir=assets_dir, config_path=config_path,
+        )
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
@@ -303,6 +313,11 @@ class TVApp:
         event = self.input.get(timeout=timeout if block else 0.0)
         if event is not None:
             self.handle_event(event)
+            # Publish straight away rather than waiting out the status
+            # interval: the dashboard's input test is "press a button, see it
+            # light up", and a two-second lag on that reads as broken.
+            self._status_due = 0.0
+            self._maybe_write_status(self._clock())
 
     def _maybe_commit_switch(self, now: float) -> None:
         """Cut over to the preloaded channel once the bridge window has elapsed."""
@@ -324,6 +339,12 @@ class TVApp:
         if action == Action.SHUTDOWN:
             self.close_menu()
             self._power_off()
+            return
+        # Administrative, not a button on the remote: it comes from the
+        # dashboard having just rewritten config.yaml. Handled up here so it
+        # works during the splash, in standby, and with the menu open.
+        if action == Action.RELOAD:
+            self.reload_config()
             return
 
         # Any other button cuts the boot splash short and starts the TV. The
@@ -373,6 +394,86 @@ class TVApp:
             handler = handlers.get(action)
             if handler is not None:
                 handler()
+
+    # -- reloading ----------------------------------------------------------
+    def reload_config(self) -> bool:
+        """Re-read the config file and rebuild the lineup, mid-programme.
+
+        Returns True if the new config was taken up. A config that will not
+        load is logged and ignored on purpose: a box that goes dark because
+        somebody typo'd a channel name is far worse than one running slightly
+        stale settings, and the dashboard is the only way back in.
+
+        Whatever is on screen keeps playing unless the channel it belongs to
+        actually changed - being on a phone renaming channel 9 must not restart
+        the film someone else is halfway through.
+
+        Some of the config is welded in when the process starts and cannot be
+        picked up here: the CRT shader, the 4:3 letterboxing and which input
+        backends exist are all handed to mpv and to the input manager once. The
+        dashboard knows this and says so rather than pretending.
+        """
+        if self._config_path is None:
+            log.info("reload asked for, but this app was not built from a config file")
+            return False
+
+        try:
+            config = load_config(self._config_path)
+        except (ConfigError, OSError):
+            log.warning(
+                "reload: %s would not load, keeping the running config",
+                self._config_path, exc_info=True,
+            )
+            self.overlay.show_message("CONFIG ERROR  -  KEEPING CURRENT SETUP")
+            return False
+
+        was_number = self.lineup.current.number
+        was_path = self.lineup.current.config.path
+
+        self.config = config
+        self.overlay.use_config(config)
+        self.lineup = build_lineup(config, wall_clock=self._wall_clock)
+        self._bumper_rng = random.Random(config.shuffle_seed)
+        self._bumpers = self._load_bumpers()
+        self._transition_path = self._resolve_transition_asset()
+
+        if config.audio_device and config.audio_device != self._audio_device:
+            self._audio_device = config.audio_device
+            try:
+                self.player.set_audio_device(config.audio_device)
+            except Exception:  # noqa: BLE001 - a bad device name must not kill the TV
+                log.warning(
+                    "could not switch audio output to %s", config.audio_device,
+                    exc_info=True,
+                )
+
+        if self.lineup.has_number(was_number):
+            self.lineup.select_number(was_number)
+            # Same channel, different folder: what is on screen is no longer
+            # what that channel is, so it has to be retuned.
+            retune = self.lineup.current.config.path != was_path
+        else:
+            # The channel being watched was deleted. Land somewhere sensible
+            # rather than pointing at nothing.
+            wanted = config.start_channel
+            if wanted is not None and self.lineup.has_number(wanted):
+                self.lineup.select_number(wanted)
+            else:
+                self.lineup.select_index(0)
+            retune = True
+
+        self._daypart_marker = self._daypart_snapshot(self.lineup.current)
+        if retune and not self.standby and not self._splash_active:
+            self.tune_current(show_static=False)
+
+        if self._menu is not None:
+            self._menu.context = self._menu_context()
+            self._draw_menu()
+
+        log.info(
+            "config reloaded from %s: %d channels", self._config_path, len(self.lineup)
+        )
+        return True
 
     # -- channel changing ---------------------------------------------------
     def _channel_up(self) -> None:
@@ -511,11 +612,23 @@ class TVApp:
         self._running = False  # exit the main loop
 
     def _run_power_off_command(self) -> None:
-        command = list(self.config.power_off_command)
+        command = tuple(self.config.power_off_command)
         if not command:
             return  # disabled / test mode
+        # The last thing between a config value and a real exec on this box.
+        # config.py already refuses to hand out anything but a plain shutdown,
+        # so reaching this is a bug rather than an attack - but this is the
+        # line that actually launches the process, and the config behind it can
+        # be replaced from a dashboard with no password, so it checks for
+        # itself instead of trusting whoever built the Config.
+        if command not in POWER_OFF_COMMANDS:
+            log.error(
+                "refusing to run a power-off command that is not a shutdown: %s",
+                " ".join(command),
+            )
+            return
         try:
-            subprocess.Popen(command)
+            subprocess.Popen(list(command))
         except Exception:  # noqa: BLE001
             log.exception("power-off command failed: %s", command)
 
@@ -637,6 +750,10 @@ class TVApp:
     def _next_bumper(self) -> Optional[Path]:
         """The next bumper to air, honouring ``bumper_chance``."""
         if self._bumpers is None or self._bumpers.is_empty:
+            return None
+        # A channel may opt out entirely: station idents between items on a
+        # news or music channel are wrong rather than nostalgic.
+        if not self.lineup.current.config.bumpers:
             return None
         chance = self.config.bumper_chance
         if chance < 1.0 and self._bumper_rng.random() >= chance:
@@ -763,7 +880,48 @@ class TVApp:
                 else int(remaining // 60) + (1 if remaining % 60 else 0)
             ),
             "channel_count": len(self.lineup),
+            # For the now-playing page. Position comes free from the player;
+            # the duration is only reported when it is already in the probe
+            # cache, because this runs every couple of seconds and forking
+            # ffprobe on a timer would be a real cost on a small box.
+            "position": self.player.get_time_pos(),
+            "duration": self._known_duration(),
+            "lineup": self._lineup_snapshot(now),
+            # For the dashboard's input test: which sources are live, and the
+            # last few presses with the action each one mapped to.
+            "input": {
+                "backends": self.input.backend_names(),
+                "recent": self.input.recent(),
+            },
         }
+
+    def _known_duration(self) -> Optional[float]:
+        if self._playing_path is None:
+            return None
+        from .probe import cached_media
+
+        info = cached_media(self._playing_path)
+        return info.duration if info is not None else None
+
+    def _lineup_snapshot(self, now: float) -> List[dict]:
+        """What every channel is showing, for the viewer page.
+
+        ``peek_now`` is deliberately cheap: it answers only for channels whose
+        schedule already exists (broadcast channels somebody has tuned to), and
+        returns nothing rather than building one. A guide that ffprobed every
+        file on every channel to draw itself would stall the television.
+        """
+        rows = []
+        for channel in self.lineup:
+            playing = channel.peek_now(now)
+            rows.append({
+                "number": channel.number,
+                "name": channel.name_at(now),
+                "off_air": channel.is_off_air(now),
+                "now_playing": _episode_title(playing) if playing else "",
+                "current": channel.number == self.lineup.current.number,
+            })
+        return rows
 
     def _maybe_write_status(self, now: float) -> None:
         if now < self._status_due:
@@ -1018,9 +1176,11 @@ def _episode_title(path: Path) -> str:
     return " ".join(path.stem.replace("_", " ").replace(".", " ").split())
 
 
-def run_from_config(config: Config, *, dry_run: bool = False) -> int:
+def run_from_config(
+    config: Config, *, dry_run: bool = False, config_path: Optional[Path] = None
+) -> int:
     """Convenience entry point used by the CLI. Returns the process exit code."""
-    app = TVApp.from_config(config, dry_run=dry_run)
+    app = TVApp.from_config(config, dry_run=dry_run, config_path=config_path)
     app.run()
     # Tell systemd the difference between "crashed, restart me" and "the viewer
     # asked me to shut the machine down".

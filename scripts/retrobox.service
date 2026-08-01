@@ -22,6 +22,11 @@ User=__USER__
 Group=__USER__
 # Access to the framebuffer/GPU, input devices and audio.
 SupplementaryGroups=video render input audio tty
+# Deliberately no NoNewPrivileges= and no CapabilityBoundingSet= here either.
+# Volume-down-past-zero and the sleep timer switch the box off by running
+# `sudo poweroff` (power_off_command in retrobox/config.py), and both of those
+# settings stop sudo reaching root - scripts/retrobox-web.service has the long
+# version. A power switch that silently does nothing is not a hardening win.
 WorkingDirectory=__REPO_DIR__
 Environment=HOME=__HOME__
 # Render straight to the console/HDMI via KMS-DRM.

@@ -8,8 +8,13 @@
 
 [Unit]
 Description=Retro Box web dashboard
-After=network-online.target
-Wants=network-online.target
+# network.target, NOT network-online.target. The latter pulls in
+# NetworkManager-wait-online (or systemd-networkd-wait-online), which on a box
+# with nothing plugged in blocks for its full timeout - a couple of minutes of
+# no dashboard for no reason. Listening on 0.0.0.0 needs no route and no link:
+# the socket binds immediately and starts answering the moment an interface
+# turns up. Nothing about the network may hold this box up.
+After=network.target
 
 [Service]
 Type=simple
@@ -19,7 +24,74 @@ WorkingDirectory=__REPO_DIR__
 Environment=HOME=__HOME__
 # Must match the TV's, or the two won't find the same status file and socket.
 Environment=XDG_RUNTIME_DIR=/run/user/__UID__
-ExecStart=__REPO_DIR__/.venv/bin/retrobox-web --config __REPO_DIR__/config.yaml --port 8080
+
+# --- Binding port 80 as an ordinary user -------------------------------------
+# The dashboard listens on 80 so the address a customer types has no port in
+# it: http://retrobox.local. Ports below 1024 normally need root, and running
+# a network-facing process as root to save four characters in a URL is a bad
+# trade - so instead the kernel is asked for exactly one capability.
+#
+# AmbientCapabilities is the set the process actually starts with. It is the
+# ambient set specifically, because the ordinary inheritable set is dropped
+# when systemd switches to User= above; ambient capabilities are the mechanism
+# built for precisely this - keeping one privilege across that switch.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# --- Why there is no NoNewPrivileges= and no CapabilityBoundingSet= ----------
+# Both used to be here. Both were wrong - not "less strict than they could be",
+# wrong: with either one set, every privileged button on this dashboard fails
+# on a customer's box, and that box has no SSH and no way to be told why.
+#
+# Everything privileged this service does, it does by shelling out to sudo:
+# systemctl restart / reboot / poweroff, timedatectl set-timezone, tee and
+# chmod on the two netplan files, netplan try and apply, iw scan, hostnamectl
+# set-hostname. sudo reaches root the only way an ordinary user can - the
+# setuid bit on /usr/bin/sudo.
+#
+# NoNewPrivileges=yes sets the kernel's no_new_privs flag, and no_new_privs
+# makes execve ignore the setuid bit. sudo then does not fail the sudoers
+# check - it never becomes root at all, and says so: "sudo: The 'no new
+# privileges' flag is set, which prevents sudo from running as root". The
+# comment that used to sit here argued no_new_privs and ambient capabilities
+# get along fine. They do. It was true and it was beside the point: the
+# problem was never the capability, it was sudo.
+#
+# CapabilityBoundingSet is a ceiling on every process this unit ever starts,
+# and the kernel applies it across a setuid exec as well. A bounding set of
+# one capability therefore hands sudo a uid 0 holding one capability, which is
+# root in name only: it cannot even finish sudo's own job (that needs
+# CAP_SETUID and CAP_SETGID), and netplan and iw want CAP_NET_ADMIN on top.
+# Enumerating what every command a future apt upgrade might run needs is
+# exactly the guess that ships as a dead Network page, so it is not guessed.
+#
+# Given up: this unit no longer prevents the dashboard process from exec'ing a
+# setuid binary. Kept: it does not run as root, and the only setuid road out
+# is sudo, which opens onto /etc/sudoers.d/retrobox-* - generated from
+# retrobox/servicectl.py, every command written out in full, no blanket
+# systemctl rule, validated with visudo before it is installed. That table is
+# the boundary here, not a capability mask. It is the thing that has to stay
+# narrow.
+#
+# Anything added to this unit later must be checked against that: DynamicUser,
+# PrivateDevices, ProtectClock, ProtectHostname, ProtectKernelTunables,
+# ProtectKernelModules, ProtectKernelLogs, LockPersonality, RestrictNamespaces,
+# RestrictAddressFamilies, RestrictSUIDSGID, MemoryDenyWriteExecute,
+# SystemCallFilter and SystemCallArchitectures all switch no_new_privs on by
+# implication, and PrivateUsers gives sudo a root that is only root inside a
+# namespace. tests/test_service_units.py fails the build if one turns up.
+
+# So the System page can show the log. Reading another unit's journal needs
+# membership of systemd-journal; granted here rather than by editing the
+# user's groups, so it applies to this service and nothing else the user runs.
+# The group exists on every systemd machine, so this cannot fail to resolve.
+SupplementaryGroups=systemd-journal
+
+# Deliberately no ProtectSystem= here. It would make /etc read-only, and
+# /etc/retrobox/config.yaml is a supported place to keep the config - the
+# dashboard would then silently lose the ability to save. Hardening that
+# breaks the feature is not hardening.
+
+ExecStart=__REPO_DIR__/.venv/bin/retrobox-web --config __REPO_DIR__/config.yaml --port 80
 Restart=on-failure
 RestartSec=5
 

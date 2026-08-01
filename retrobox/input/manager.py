@@ -9,8 +9,11 @@ what is actually available on the machine.
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from collections import deque
 from queue import Empty, Queue
-from typing import Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 
 from ..actions import InputEvent
 from .base import InputBackend
@@ -21,21 +24,57 @@ log = logging.getLogger(__name__)
 class InputManager:
     """Owns the shared event queue and the lifecycle of all input backends."""
 
-    def __init__(self, backends: List[InputBackend]) -> None:
+    #: How many recent presses the dashboard's input test can show. Small on
+    #: purpose - it rides along in the status snapshot, and this is a "did the
+    #: remote work" display, not a history.
+    RECENT_LIMIT = 40
+
+    def __init__(
+        self,
+        backends: List[InputBackend],
+        *,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self._backends = backends
         self._queue: "Queue[InputEvent]" = Queue()
         self._started = False
+        self._clock = clock
+        # Events arrive on backend threads, so the log is guarded. A deque
+        # with a maxlen is already atomic for append, but recent() copies it.
+        self._recent: Deque[Dict[str, Any]] = deque(maxlen=self.RECENT_LIMIT)
+        self._recent_lock = threading.Lock()
 
     @property
     def backends(self) -> List[InputBackend]:
         return list(self._backends)
 
+    def backend_names(self) -> List[str]:
+        """Which input sources are actually live on this box."""
+        return [b.name for b in self._backends]
+
     def start(self) -> None:
         if self._started:
             return
         for backend in self._backends:
+            backend._observer = self._record
             backend.start(self._queue)
         self._started = True
+
+    # -- the input test ------------------------------------------------------
+    def _record(self, backend: str, event: InputEvent) -> None:
+        """Note a press for the dashboard. Never allowed to affect delivery."""
+        with self._recent_lock:
+            self._recent.append({
+                "at": self._clock(),
+                "backend": backend,
+                "action": event.action.name,
+                "value": event.value,
+            })
+
+    def recent(self) -> List[Dict[str, Any]]:
+        """The last few presses, oldest first."""
+        with self._recent_lock:
+            return list(self._recent)
 
     def get(self, timeout: Optional[float] = None) -> Optional[InputEvent]:
         """Return the next input event, or None if none arrives within timeout."""
@@ -45,7 +84,8 @@ class InputManager:
             return None
 
     def put(self, event: InputEvent) -> None:
-        """Inject an event directly (used by dev mode / scripted tests)."""
+        """Inject an event directly (the dashboard's remote, dev mode, tests)."""
+        self._record("dashboard", event)
         self._queue.put(event)
 
     def stop(self) -> None:

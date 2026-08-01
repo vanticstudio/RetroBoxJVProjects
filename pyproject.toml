@@ -4,7 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "retrobox"
-version = "1.0.0"
+# Derived from retrobox/__init__.py rather than written here. One number,
+# one place: the box compares its own __version__ against the newest
+# release tag to decide whether to update, so a second copy that drifts
+# means every unit in the field reinstalls the same release for ever.
+dynamic = ["version"]
 description = "A retro TV media player for a small Linux box - fixed channels, shuffled episodes, dayparting, station bumpers and a sleep timer, with an authentic late-night cable feel."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -38,7 +42,14 @@ dev = [
 
 [project.scripts]
 retrobox = "retrobox.__main__:main"
-retrobox-web = "retrobox.webui:main"
+# Not webui:main. The dashboard's start-up has one job to do before it serves
+# anything - deciding whether the version this box was updated to actually came
+# up - and retrobox/webservice.py is where that happens. Point this back at
+# webui:main and the box silently stops being able to roll itself back.
+retrobox-web = "retrobox.webservice:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "retrobox.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["retrobox*"]

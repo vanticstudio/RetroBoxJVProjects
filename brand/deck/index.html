@@ -1,0 +1,782 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Retro Box — JV Projects</title>
+<meta name="description" content="Retro Box: turn a spare Linux box into the cable box you fell asleep in front of. Open source, MIT, and it ships empty.">
+<style>
+/* ===================================================================
+   Retro Box — deck
+   Same tokens as brand/tokens/tokens.css. Self-contained: the only
+   thing it loads is the font, from the site's copy.
+   =================================================================== */
+
+@font-face {
+  font-family: "VT323";
+  src: url("../../docs/assets/fonts/VT323-subset.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+
+:root {
+  --phosphor: #4dff5a;
+  --unlit: #123b18;
+  --tube: #05080a;
+  --paper: #d6e4d8;
+  --lede: #e8f2e9;
+  --ash: #8fa292;
+  --ember: #ff6b5a;
+  --rule: rgba(77, 255, 90, .2);
+  --wash: rgba(77, 255, 90, .045);
+  --glow: 0 0 12px rgba(77, 255, 90, .38);
+  --display: "VT323", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --body: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          Roboto, "Helvetica Neue", Arial, sans-serif;
+  --pad: clamp(1.5rem, 5vw, 5rem);
+  --pad-y: clamp(1.25rem, 4vh, 3.25rem);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+/* No scroll-snap here on purpose. Snap and smooth scrolling on the same
+   element fight each other in Chrome — a programmatic scroll gets
+   cancelled and the deck stops advancing. The arrow keys do the snapping. */
+html {
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--tube);
+  color: var(--paper);
+  font-family: var(--body);
+  font-size: clamp(.95rem, min(1.15vw, 1.9vh), 1.2rem);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible { outline: 2px solid var(--phosphor); outline-offset: 3px; }
+
+.sr {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+}
+
+/* --- the stage ------------------------------------------------------ */
+
+.slide {
+  position: relative;
+  min-height: 100svh;
+  display: grid;
+  align-content: center;
+  gap: clamp(.7rem, 1.8vh, 1.75rem);
+  padding: var(--pad-y) var(--pad) calc(var(--pad-y) + 3rem);
+  max-width: 82rem;
+  margin: 0 auto;
+  border-top: 1px solid transparent;
+}
+.slide + .slide { border-top-color: var(--unlit); }
+
+.ident {
+  display: flex;
+  align-items: baseline;
+  gap: .85rem;
+  margin: 0;
+  max-width: none;   /* it is a <p>, and p is capped at 44ch */
+  font-family: var(--display);
+  font-size: clamp(.85rem, 1vw, 1rem);
+  letter-spacing: .34em;
+  text-transform: uppercase;
+  color: var(--phosphor);
+  text-shadow: var(--glow);
+}
+.ident b { font-weight: 400; white-space: nowrap; }
+.ident span { color: var(--ash); text-shadow: none; }
+
+h1, h2, h3 {
+  margin: 0;
+  font-family: var(--display);
+  font-weight: 400;
+  color: var(--paper);
+  letter-spacing: .005em;
+  text-wrap: balance;
+}
+h1 { font-size: clamp(2.2rem, min(6vw, 9vh), 5rem); line-height: .98; }
+h2 { font-size: clamp(1.7rem, min(4.4vw, 6.2vh), 3.6rem); line-height: 1.02; max-width: 22ch; }
+h3 { font-size: clamp(1.15rem, min(1.9vw, 2.7vh), 1.6rem); line-height: 1.06; color: var(--phosphor); text-shadow: var(--glow); }
+
+p { margin: 0; max-width: 44ch; }
+.lede { font-size: clamp(1rem, min(1.5vw, 2.4vh), 1.35rem); line-height: 1.45; color: var(--lede); max-width: 40ch; }
+.note { color: var(--ash); font-size: clamp(.8rem, min(1vw, 1.6vh), .95rem); max-width: 52ch; }
+
+.cols {
+  display: grid;
+  gap: clamp(1.1rem, 3vw, 3.25rem);
+  margin-top: clamp(.25rem, 1.4vh, 1.1rem);
+}
+@media (min-width: 60rem) { .cols { grid-template-columns: 1fr 1fr; align-items: start; } }
+
+/* --- title ---------------------------------------------------------- */
+
+.lockup { display: inline-block; margin: 0 0 clamp(1rem, 3.5vh, 2.75rem); }
+.lockup-word {
+  display: block;
+  font-family: var(--display);
+  font-size: clamp(2.8rem, 7vw, 6rem);
+  line-height: 1;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--phosphor);
+  text-shadow: var(--glow);
+  border-bottom: .055em solid var(--phosphor);
+  padding-bottom: .06em;
+}
+.lockup-sub {
+  display: block;
+  font-family: var(--display);
+  font-size: clamp(.8rem, 1.5vw, 1.3rem);
+  letter-spacing: .42em;
+  text-transform: uppercase;
+  color: #46bd53;
+  text-align: center;
+  padding: .35em 0 0 .42em;
+}
+.slide-title { justify-items: start; }
+.slide-title .lede { margin-top: .5rem; }
+
+/* --- lists ---------------------------------------------------------- */
+
+.nots { list-style: none; margin: 0; padding: 0; }
+.nots li {
+  display: flex; align-items: center; gap: .8rem;
+  padding: .5rem 0;
+  border-bottom: 1px solid var(--unlit);
+  font-family: var(--display);
+  font-size: clamp(1.15rem, 1.7vw, 1.6rem);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--ash);
+}
+.nots li:last-child { border-bottom: 0; }
+.nots li::before {
+  content: ""; flex: none; width: .7rem; height: .7rem; border-radius: 1px;
+  background: var(--unlit); box-shadow: inset 0 0 0 1px rgba(77, 255, 90, .16);
+}
+
+.five { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; background: var(--unlit); }
+.five li { background: var(--tube); padding: clamp(.6rem, 1.35vh, 1.1rem) 0; }
+@media (min-width: 60rem) {
+  .five { grid-template-columns: 1fr 1fr; column-gap: clamp(2rem, 4vw, 4rem); background: none; }
+  .five li { border-top: 1px solid var(--unlit); padding-top: clamp(.65rem, 1.5vh, 1.2rem); }
+  .five li:nth-child(5) { grid-column: 1 / -1; }
+}
+.five p { color: var(--ash); margin-top: .25rem; max-width: 42ch; font-size: clamp(.82rem, min(1.05vw, 1.7vh), 1rem); }
+
+.kit { width: 100%; border-collapse: collapse; text-align: left; }
+.kit th, .kit td { padding: clamp(.45rem, 1.15vh, .9rem) 0; border-top: 1px solid var(--unlit); vertical-align: top; }
+.kit th {
+  font-family: var(--display); font-weight: 400;
+  font-size: clamp(1.1rem, 1.5vw, 1.45rem);
+  letter-spacing: .06em; text-transform: uppercase;
+  color: var(--phosphor); text-shadow: var(--glow);
+  padding-right: 2rem; width: 34%;
+}
+.kit td { color: var(--paper); }
+
+/* --- the two ways to get one ---------------------------------------- */
+
+.way {
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--wash);
+  padding: clamp(.9rem, 2vh, 1.6rem);
+  display: grid;
+  gap: .55rem;
+  align-content: start;
+}
+.way ul { margin: 0; padding-left: 1.1rem; color: var(--paper); }
+.way li { margin-bottom: .35rem; }
+.way .price {
+  font-family: var(--display); font-size: clamp(1.2rem, 1.8vw, 1.6rem);
+  letter-spacing: .08em; text-transform: uppercase; color: var(--phosphor);
+  text-shadow: var(--glow);
+}
+.way-soon { border-style: dashed; }
+.tag {
+  justify-self: start;
+  font-family: var(--display); font-size: .85rem; letter-spacing: .2em;
+  text-transform: uppercase; color: var(--ash);
+  border: 1px solid var(--unlit); border-radius: 2px; padding: .1rem .5rem;
+}
+
+.facts { list-style: none; margin: 0; padding: 0; display: grid; gap: clamp(.45rem, 1.3vh, 1rem); }
+@media (min-width: 60rem) { .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: clamp(2rem, 4vw, 4rem); } }
+.facts li { border-top: 1px solid var(--unlit); padding-top: .7rem; }
+.facts b {
+  display: block; font-family: var(--display); font-weight: 400;
+  font-size: clamp(1.4rem, min(2.6vw, 3.6vh), 2.2rem); line-height: 1;
+  letter-spacing: .04em; color: var(--phosphor); text-shadow: var(--glow);
+}
+.facts span { color: var(--ash); font-size: clamp(.85rem, 1vw, .95rem); }
+
+.warn {
+  border: 1px solid rgba(255, 107, 90, .35);
+  border-left: 2px solid var(--ember);
+  border-radius: 3px;
+  background: rgba(255, 107, 90, .06);
+  color: #ffd7d1;
+  padding: .9rem 1.1rem;
+  max-width: 46ch;
+  font-size: clamp(.9rem, 1.05vw, 1rem);
+}
+
+.links { display: flex; flex-wrap: wrap; gap: .8rem; margin-top: .5rem; }
+.links a {
+  display: inline-flex; align-items: center; min-height: 3rem; padding: 0 1.2rem;
+  border: 1px solid var(--phosphor); border-radius: 3px;
+  background: var(--wash); color: var(--phosphor); text-decoration: none;
+  font-family: var(--display); font-size: clamp(1rem, 1.2vw, 1.15rem);
+  letter-spacing: .14em; text-transform: uppercase;
+  transition: background .16s ease, box-shadow .16s ease;
+}
+.links a:hover, .links a:focus-visible {
+  background: rgba(77, 255, 90, .16);
+  box-shadow: 0 0 26px -8px rgba(77, 255, 90, .65);
+}
+
+/* --- chrome --------------------------------------------------------- */
+
+.bug {
+  position: fixed;
+  right: clamp(1rem, 3vw, 2rem);
+  bottom: calc(clamp(1rem, 3vw, 2rem) + env(safe-area-inset-bottom, 0px));
+  z-index: 40;
+  display: flex; align-items: baseline; gap: .7rem;
+  padding: .4rem .8rem;
+  border: 1px solid var(--rule); border-radius: 3px;
+  background: rgba(5, 8, 10, .86);
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  font-family: var(--display); font-size: .95rem;
+  letter-spacing: .18em; text-transform: uppercase; color: var(--phosphor);
+  text-shadow: var(--glow);
+  pointer-events: none;
+}
+.bug em { font-style: normal; color: var(--ash); }
+
+.hint {
+  position: fixed;
+  left: clamp(1rem, 3vw, 2rem);
+  bottom: calc(clamp(1rem, 3vw, 2rem) + env(safe-area-inset-bottom, 0px));
+  z-index: 40;
+  font-family: var(--display); font-size: .9rem;
+  letter-spacing: .18em; text-transform: uppercase; color: var(--ash);
+  transition: opacity .4s ease;
+  pointer-events: none;
+}
+.hint[data-gone] { opacity: 0; }
+
+/* --- the guide -------------------------------------------------------
+   The box has one menu, on the G key, and so does the site. Here the
+   channels are the slides. Same grammar: `*` is where you are, `>` is
+   the cursor, and it clears itself after guide_seconds.
+   --------------------------------------------------------------------- */
+
+kbd {
+  display: inline-block;
+  min-width: 1.6em;
+  padding: .05em .35em;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: rgba(77, 255, 90, .07);
+  color: var(--phosphor);
+  font-family: var(--display);
+  font-size: 1em;
+  line-height: 1.3;
+  text-align: center;
+}
+
+.tuner {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--pad-y) var(--pad);
+  background: rgba(5, 8, 10, .62);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+}
+
+.tuner-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(100%, 48rem);
+  max-height: 80vh;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: rgba(5, 8, 10, .98);
+  animation: tune-in .22s cubic-bezier(.16, 1, .3, 1) both;
+}
+
+@keyframes tune-in {
+  from { transform: translateY(1rem); opacity: 0; }
+  to   { transform: none; opacity: 1; }
+}
+
+.tuner-head {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  padding: .7rem 1rem;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--display);
+  font-size: .9rem;
+  letter-spacing: .3em;
+  text-transform: uppercase;
+  color: var(--phosphor);
+  text-shadow: var(--glow);
+}
+.tuner-head span:last-child { letter-spacing: .14em; font-variant-numeric: tabular-nums; }
+
+.tuner-scroll { overflow-y: auto; overscroll-behavior: contain; }
+
+.tuner-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--display);
+  font-size: clamp(1rem, 1.5vw, 1.25rem);
+  letter-spacing: .03em;
+  color: var(--phosphor);
+  text-shadow: var(--glow);
+}
+.tuner-table td {
+  padding: .5rem;
+  vertical-align: top;
+  border-bottom: 1px solid var(--unlit);
+}
+.tuner-table tr:last-child td { border-bottom: 0; }
+.tuner-table tr { cursor: pointer; }
+.tuner-table tr:hover { background: rgba(77, 255, 90, .08); }
+.tuner-table .is-cursor { background: rgba(77, 255, 90, .13); }
+.t-mark { width: 1.6em; text-align: center; }
+.t-num { width: 3em; }
+.t-name { text-transform: uppercase; white-space: nowrap; }
+.t-show { color: #cfeed3; }
+
+.tuner-foot {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: .4rem 1.2rem;
+  margin: 0;
+  max-width: none;
+  padding: .75rem 1rem;
+  border-top: 1px solid var(--unlit);
+  color: var(--ash);
+  font-family: var(--display);
+  font-size: .9rem;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.tuner-foot kbd { margin-right: .25em; }
+
+/* --- print: one slide per page --------------------------------------- */
+
+@media print {
+  :root { --pad: 14mm; }
+  body { background: #fff; color: #111; font-size: 11pt; }
+  .slide {
+    min-height: auto; page-break-after: always; break-after: page;
+    border-top: 0; padding: var(--pad); max-width: none;
+  }
+  h1, h2, h3, .lockup-word, .ident, .facts b, .kit th, .way .price {
+    color: #05080a; text-shadow: none;
+  }
+  .lockup-word { border-bottom-color: #05080a; }
+  .lockup-sub, .ident span, .note, .facts span, .five p, .nots li { color: #555; }
+  .nots li::before { background: #ccc; box-shadow: none; }
+  .bug, .hint, .tuner { display: none; }
+  .way, .warn { background: none; border-color: #bbb; }
+  .links a { border-color: #05080a; color: #05080a; background: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .tuner-panel { animation: none; }
+  *, *::before, *::after { transition-duration: .01ms !important; }
+}
+</style>
+</head>
+<body>
+
+<main>
+
+<!-- 01 ------------------------------------------------------------- -->
+<section class="slide slide-title" id="s1" aria-labelledby="s1h">
+  <p class="lockup">
+    <span class="lockup-word">Retro&nbsp;Box</span>
+    <span class="lockup-sub">JV Projects</span>
+  </p>
+  <h1 id="s1h">The cable box you fell asleep in front&nbsp;of.</h1>
+  <p class="lede">A spare mini PC, a folder of your own video, and any remote from the drawer. It comes up as a television.</p>
+  <p class="note">JV Projects · 2026 · MIT licensed · v1.0.3</p>
+</section>
+
+<!-- 02 ------------------------------------------------------------- -->
+<section class="slide" id="s2" aria-labelledby="s2h">
+  <p class="ident"><b>CH 02</b><span>The problem</span></p>
+  <h2 id="s2h">You sat down to watch something.</h2>
+  <div class="cols">
+    <div>
+      <p class="lede">Ten minutes later you are still choosing.</p>
+      <p style="margin-top:1rem">Four apps. Three profiles. A wall of things you have already seen, a trailer that starts playing on its own, and a countdown to something you did not ask for. Every one of those screens exists to be browsed, and browsing is now the activity.</p>
+    </div>
+    <div>
+      <p style="margin-bottom:1rem">The television used to be the easiest object in the house. You pressed a button and it was on. Whatever was on was on.</p>
+      <p class="note">Nobody set out to make watching television into work. It happened because every screen in the chain had something to recommend.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 03 ------------------------------------------------------------- -->
+<section class="slide" id="s3" aria-labelledby="s3h">
+  <p class="ident"><b>CH 03</b><span>What it is</span></p>
+  <h2 id="s3h">Press channel-up. Something is already playing.</h2>
+  <div class="cols">
+    <div>
+      <p class="lede">A few seconds in, like you just tuned in.</p>
+      <p style="margin-top:1rem">Retro Box plays folders of video off a drive as if they were real TV channels. When an episode ends the next one rolls, on an endless shuffle. Channels change with the clock. A sleep timer turns the whole thing off when you don’t.</p>
+      <p style="margin-top:1rem">There is nothing to choose, because there is nothing to choose from.</p>
+    </div>
+    <div>
+      <ul class="nots">
+        <li>No menus</li>
+        <li>No apps</li>
+        <li>No accounts</li>
+        <li>No recommendations</li>
+        <li>No algorithm</li>
+        <li>No internet</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- 04 ------------------------------------------------------------- -->
+<section class="slide" id="s4" aria-labelledby="s4h">
+  <p class="ident"><b>CH 04</b><span>Why it feels like cable</span></p>
+  <h2 id="s4h">Five things, and none of them are features.</h2>
+  <ul class="five">
+    <li>
+      <h3>Dayparting</h3>
+      <p>Wall-clock windows rename a channel, swap its folder, or sign it off to colour bars. 22:00 arrives and the channel changes under you, mid-episode. The schedule doesn’t wait for you to be ready.</p>
+    </li>
+    <li>
+      <h3>Broadcast mode</h3>
+      <p>Each channel advances against the clock whether anyone is watching or not. Flip away and back ten minutes later and you have missed ten minutes.</p>
+    </li>
+    <li>
+      <h3>Station bumpers</h3>
+      <p>A folder of idents plays between episodes, shuffled so you never get the same one twice, rolling straight into the next show. The gaps are the part you actually remember.</p>
+    </li>
+    <li>
+      <h3>The channel guide</h3>
+      <p>One button, a green grid, and it clears itself off the screen after eight seconds without being asked. It is the only menu in the product.</p>
+    </li>
+    <li>
+      <h3>The sleep timer</h3>
+      <p>30 → 60 → 90 → off, counting down in the corner. When it runs out it blanks the screen, or shuts the machine down properly. This is a box that lives next to a bed, and it knows it.</p>
+    </li>
+  </ul>
+</section>
+
+<!-- 05 ------------------------------------------------------------- -->
+<section class="slide" id="s5" aria-labelledby="s5h">
+  <p class="ident"><b>CH 05</b><span>What it runs on</span></p>
+  <h2 id="s5h">Nothing exotic. Probably nothing new.</h2>
+  <div class="cols">
+    <div>
+      <table class="kit">
+        <caption class="sr">Hardware required</caption>
+        <tbody>
+          <tr><th scope="row">A machine</th><td>Any x86 mini PC that boots Linux, or a Raspberry Pi 4. 4&nbsp;GB of RAM is plenty.</td></tr>
+          <tr><th scope="row">A display</th><td>A TV, ideally. Any HDMI monitor works.</td></tr>
+          <tr><th scope="row">A Flirc</th><td>Teaches itself any IR remote and hands it to Linux as a keyboard.</td></tr>
+          <tr><th scope="row">A remote</th><td>Whatever is in the drawer. Six buttons cover the basics.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div>
+      <p class="lede">Cheap hardware is the point, not a compromise.</p>
+      <p style="margin-top:1rem">A decade-old CPU is fine once hardware decode is on, and the installer works out which decode path the machine needs on its own — VA-API on a PC, V4L2 on a Pi. It boots straight to the picture with no login and no desktop.</p>
+      <p class="note" style="margin-top:1rem">An ex-office desktop off eBay is the intended machine, not the fallback.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 06 ------------------------------------------------------------- -->
+<section class="slide" id="s6" aria-labelledby="s6h">
+  <p class="ident"><b>CH 06</b><span>How you get one</span></p>
+  <h2 id="s6h">Take the code, or take the Saturday back.</h2>
+  <div class="cols">
+    <div class="way">
+      <p class="price">Build your own</p>
+      <p class="note">MIT · free · an evening</p>
+      <ul>
+        <li>The whole thing is in the repo. No paid tier, no key, nothing held back.</li>
+        <li>One install script. It detects the platform and installs the right driver.</li>
+        <li>Asks you to be comfortable with a terminal and an SSH session.</li>
+      </ul>
+    </div>
+    <div class="way way-soon">
+      <p class="price">Buy one ready to go</p>
+      <span class="tag">Not live yet</span>
+      <ul>
+        <li>Hardware sourced and tested on a unit that is known to work.</li>
+        <li>OS, drivers, audio, autostart and remote already configured.</li>
+        <li>Plugs in and works. Someone to ask when it doesn’t.</li>
+      </ul>
+    </div>
+  </div>
+  <p class="warn">Either way it ships empty. You supply your own files — that part does not change, and it is not something a paid box can do for you.</p>
+</section>
+
+<!-- 07 ------------------------------------------------------------- -->
+<section class="slide" id="s7" aria-labelledby="s7h">
+  <p class="ident"><b>CH 07</b><span>Where it is</span></p>
+  <h2 id="s7h">Finished enough to live in a lounge room.</h2>
+  <ul class="facts">
+    <li><b>v1.0.3</b><span>Released, with an updater that rolls itself back if an update doesn’t come up cleanly</span></li>
+    <li><b>941 tests</b><span>The whole suite runs headless in about eight seconds — no media, no display, no libmpv</span></li>
+    <li><b>3.9 · 3.11 · 3.13</b><span>Every push runs the suite across all three, and shellchecks the installer</span></li>
+    <li><b>Zero setup</b><span>A browser dashboard on the box covers everything you would otherwise SSH in for</span></li>
+  </ul>
+  <p class="note" style="margin-top:1.5rem">No adoption numbers here on purpose. There aren’t any yet, and made-up ones would be the least trustworthy slide in the deck.</p>
+</section>
+
+<!-- 08 ------------------------------------------------------------- -->
+<section class="slide" id="s8" aria-labelledby="s8h">
+  <p class="ident"><b>CH 08</b><span>Take a look</span></p>
+  <h2 id="s8h">It is all public. Go and read it.</h2>
+  <p class="lede">The README is 600 lines and it is the honest version — including the parts that are fiddly.</p>
+  <p class="links">
+    <a href="https://vanticstudio.github.io/RetroBoxJVProjects/">The site</a>
+    <a href="https://github.com/vanticstudio/RetroBoxJVProjects">The source</a>
+  </p>
+  <p class="note" style="margin-top:2rem">Retro Box · JV Projects · MIT licensed · © 2026<br>
+  VT323 is used under the SIL Open Font License.</p>
+</section>
+
+</main>
+
+<p class="bug" id="bug" aria-hidden="true"><span id="bug-n">CH 01</span><em id="bug-of">of 08</em></p>
+<p class="hint" id="hint" aria-hidden="true">↓ or → to advance · G for the guide</p>
+
+<!-- The same guide as the box and the site. Here the channels are slides. -->
+<div class="tuner" id="tuner" role="dialog" aria-modal="true"
+     aria-label="Slide guide" hidden>
+  <div class="tuner-panel">
+    <div class="tuner-head"><span>Guide</span><span id="tuner-clock">--:--</span></div>
+    <div class="tuner-scroll">
+      <table class="tuner-table">
+        <caption class="sr">The slides in this deck, as channels</caption>
+        <tbody id="tuner-rows"></tbody>
+      </table>
+    </div>
+    <p class="tuner-foot">
+      <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> browse</span>
+      <span><kbd>Enter</kbd> tune</span>
+      <span><kbd>G</kbd> or <kbd>Esc</kbd> close</span>
+    </p>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var slides = [].slice.call(document.querySelectorAll('.slide'));
+  var bugN = document.getElementById('bug-n');
+  var bugOf = document.getElementById('bug-of');
+  var hint = document.getElementById('hint');
+  var shown = -1;
+  var ticking = false;
+
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  bugOf.textContent = 'of ' + pad(slides.length);
+
+  /* Which slide are we on? Worked out from the scroll position every time
+     it is asked, rather than tracked in a variable. Nothing to fall out of
+     sync, and no IntersectionObserver to depend on. */
+  function currentIndex() {
+    var y = (document.scrollingElement || document.documentElement).scrollTop;
+    var best = 0, bestGap = Infinity, i, gap;
+    for (i = 0; i < slides.length; i++) {
+      gap = Math.abs(slides[i].offsetTop - y);
+      if (gap < bestGap) { bestGap = gap; best = i; }
+    }
+    return best;
+  }
+
+  function paint() {
+    var i = currentIndex();
+    if (i === shown) { return; }
+    shown = i;
+    bugN.textContent = 'CH ' + pad(i + 1);
+  }
+
+  function onScroll() {
+    if (ticking) { return; }
+    ticking = true;
+    window.requestAnimationFrame(function () { ticking = false; paint(); });
+  }
+
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll, { passive: true });
+  paint();
+
+  function go(i) {
+    i = Math.max(0, Math.min(slides.length - 1, i));
+    slides[i].scrollIntoView({ block: 'start' });
+    shown = -1;
+    window.setTimeout(paint, 60);
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.metaKey || e.ctrlKey || e.altKey) { return; }
+    switch (e.key) {
+      case 'ArrowRight': case 'ArrowDown': case 'PageDown': case ' ':
+        e.preventDefault(); go(currentIndex() + 1); break;
+      case 'ArrowLeft': case 'ArrowUp': case 'PageUp':
+        e.preventDefault(); go(currentIndex() - 1); break;
+      case 'Home': e.preventDefault(); go(0); break;
+      case 'End': e.preventDefault(); go(slides.length - 1); break;
+      default: return;
+    }
+    if (hint) { hint.setAttribute('data-gone', ''); }
+  });
+
+  window.setTimeout(function () {
+    if (hint) { hint.setAttribute('data-gone', ''); }
+  }, 8000);
+
+  /* --- the guide -------------------------------------------------
+     Same device as the box and the site, on the same key. Here the
+     channels are the slides. */
+
+  var GUIDE_SECONDS = 8;              /* config: guide_seconds */
+  var tuner = document.getElementById('tuner');
+  var rowHost = document.getElementById('tuner-rows');
+  var tclock = document.getElementById('tuner-clock');
+  if (!tuner || !rowHost) { return; }
+
+  var gcursor = 0, gidle = null, gtick = null;
+
+  function cell(cls, text) {
+    var td = document.createElement('td');
+    td.className = cls;
+    if (text) { td.textContent = text; }
+    return td;
+  }
+
+  function gbuild() {
+    rowHost.textContent = '';
+    var here = currentIndex();
+    slides.forEach(function (slide, i) {
+      var ident = slide.querySelector('.ident span');
+      var head = slide.querySelector('h1, h2');
+      var tr = document.createElement('tr');
+      tr.appendChild(cell('t-mark'));
+      tr.appendChild(cell('t-num', pad(i + 1)));
+      tr.appendChild(cell('t-name', ident ? ident.textContent.trim() : 'Ident'));
+      tr.appendChild(cell('t-show', head ? head.textContent.trim() : ''));
+      tr.addEventListener('click', function () { gtune(i); });
+      tr.addEventListener('mousemove', function () { gmove(i); });
+      rowHost.appendChild(tr);
+    });
+    gcursor = here;
+    gpaint();
+  }
+
+  function gpaint() {
+    var rows = rowHost.children, here = currentIndex(), i;
+    for (i = 0; i < rows.length; i++) {
+      var on = i === gcursor;
+      rows[i].classList.toggle('is-cursor', on);
+      rows[i].setAttribute('aria-current', on ? 'true' : 'false');
+      rows[i].firstChild.textContent = on ? '>' : (i === here ? '*' : '');
+    }
+  }
+
+  function gmove(to) {
+    gcursor = Math.max(0, Math.min(slides.length - 1, to));
+    gpaint();
+    ghold();
+  }
+
+  function gclock() {
+    if (!tclock) { return; }
+    var d = new Date();
+    tclock.textContent = pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+
+  function ghold() {
+    window.clearTimeout(gidle);
+    gidle = window.setTimeout(gclose, GUIDE_SECONDS * 1000);
+  }
+
+  function gopen() {
+    gbuild();
+    gclock();
+    tuner.hidden = false;
+    gtick = window.setInterval(gclock, 20000);
+    ghold();
+    tuner.focus();
+  }
+
+  function gclose() {
+    window.clearTimeout(gidle);
+    window.clearInterval(gtick);
+    tuner.hidden = true;
+  }
+
+  function gtune(i) {
+    gclose();
+    window.requestAnimationFrame(function () { go(i); });
+  }
+
+  tuner.tabIndex = -1;
+  tuner.addEventListener('click', function (e) {
+    if (e.target === tuner) { gclose(); }
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.metaKey || e.ctrlKey || e.altKey) { return; }
+    if (tuner.hidden) {
+      if (e.key === 'g' || e.key === 'G') {
+        e.preventDefault();
+        gopen();
+        if (hint) { hint.setAttribute('data-gone', ''); }
+      }
+      return;
+    }
+    /* the guide owns the keyboard while it is up, so the slide
+       navigation below must not also see these */
+    switch (e.key) {
+      case 'ArrowDown': case 'ArrowRight': gmove(gcursor + 1); break;
+      case 'ArrowUp': case 'ArrowLeft': gmove(gcursor - 1); break;
+      case 'Home': gmove(0); break;
+      case 'End': gmove(slides.length - 1); break;
+      case 'Enter': case ' ': gtune(gcursor); break;
+      case 'Escape': case 'g': case 'G': gclose(); break;
+      default: return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+  }, true);
+}());
+</script>
+</body>
+</html>

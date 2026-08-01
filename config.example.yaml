@@ -96,11 +96,16 @@ tune_in: random
 start_channel: 2          # which channel the box powers on to
 
 # --- Boot splash -------------------------------------------------------------
-# A clip played once at start-up, before the first channel is tuned. Unset by
-# default. A bare filename is looked for in the assets folder, so this finds the
-# bundled JV Projects splash; an absolute path works too. Any button press skips
-# it, and a missing file is skipped with a warning rather than being an error.
-# boot_splash: boot_splash.mp4
+# A clip played once at start-up, before the first channel is tuned. ON by
+# default with the bundled JV Projects clip, so a box shows its own branding at
+# power-up without being asked. Any button press skips it, a missing file is
+# skipped with a warning rather than being an error, and a hard 30-second
+# timeout means a bad clip can never strand the box on a splash screen.
+#
+#   boot_splash: false              go straight to a channel, no splash
+#   boot_splash: boot_splash.mp4    the shipped clip (this is the default)
+#   boot_splash: /media/mine.mp4    your own - see retrobox/assets/README.md
+#                                   for the format it has to be in
 
 # --- Station bumpers ---------------------------------------------------------
 # A folder of short clips - idents, "we'll be right back", station promos - that
@@ -172,6 +177,12 @@ volume_step: 5            # how much each volume press changes it
 # Pressing volume-down once more when already at 0 cleanly shuts the machine
 # down (needs the sudo rule from scripts/install-service.sh).
 power_off_on_min_volume: true
+# What "off" actually runs. This is the one setting in this file that names a
+# command, so it is checked against a fixed list rather than taken as written:
+# poweroff / systemctl poweroff / shutdown -h now / halt -p, on their own or
+# behind sudo, or [] to disable switching off entirely. Anything else is
+# ignored and "sudo poweroff" is used instead. The dashboard has no password,
+# and it can replace this whole file.
 # power_off_command: ["sudo", "poweroff"]   # override the shutdown command
 
 # --- Playback ----------------------------------------------------------------
@@ -214,6 +225,79 @@ input:
 # names and numbers you set by hand (or with `retrobox --setup`) are never
 # overwritten. Folders with no video files in them are skipped.
 #
+#
+# The first time anything automatic edits this file, a copy of it as you wrote
+# it is kept next to it as config.yaml.bak, and that copy is never written
+# again. If an edit ever goes wrong, that is the file to restore.
+#
 # Needs media_root set. Off by default.
 # media_root: /media/retrobox
 # auto_channels: true
+
+
+# ---------------------------------------------------------------------------
+# The LAN dashboard's limits
+# ---------------------------------------------------------------------------
+# The dashboard at http://retrobox.local/dash can create and rename channels and
+# upload videos. Like the file share it has no login, so these two limits are
+# what stop somebody on your network filling the disk - and a full disk on this
+# box is a unit that will not start.
+#
+# Uploads are already restricted to video files landing inside media_root;
+# these bound how much space they may take.
+#
+# web:
+#   max_upload_mb: 8192    # biggest single upload accepted (default 8 GB)
+#   min_free_mb: 1024      # always leave this much free. Measured on BOTH the
+#                          #   disk the upload waits on and the disk it is
+#                          #   headed for - a channel can point at a plugged-in
+#                          #   drive, and that is the one that fills up.
+#
+# Uploading from the browser sends the file in pieces, so a dropped wifi
+# connection or a closed tab resumes instead of starting over. The pieces live
+# in a hidden .retrobox-uploads folder under media_root - never inside a
+# channel, so a half-uploaded film is never mistaken for an episode - and
+# anything abandoned is cleared off after upload_expiry_hours. Single videos and
+# a replacement boot splash wait in there too while they arrive, so what a power
+# cut leaves behind is counted on the Settings page and cleared by the same
+# timer instead of sitting in a channel folder where nothing would ever find it.
+#
+#   chunk_mb: 8              # size of each piece a file is sent in
+#   max_files_per_upload: 500
+#   max_upload_sessions: 4
+#   upload_expiry_hours: 24
+
+
+# ---------------------------------------------------------------------------
+# Software updates
+# ---------------------------------------------------------------------------
+# The box checks github.com for a newer tagged release about once a day and
+# tells you in the dashboard what changed. Where it looks is compiled in - it
+# cannot be pointed anywhere else, by anyone.
+#
+# Checking and applying are separate on purpose. Checking is harmless. Applying
+# on its own is not: one bad release would take out every box at the same
+# moment, in living rooms, with no way in to fix them. So auto_apply is off,
+# and it should stay off until the rollback has been proven on real hardware.
+#
+# A box with no internet is unaffected either way - the check fails quietly and
+# the television carries on.
+#
+# updates:
+#   check: true              # look for new versions (default: true)
+#   auto_apply: false        # install them without asking (default: false)
+#   check_interval_hours: 24 # how often to look, smeared so a fleet does not
+#                            #   all arrive at GitHub in the same second
+
+
+# ---------------------------------------------------------------------------
+# Bumpers per channel
+# ---------------------------------------------------------------------------
+# Station idents play between episodes on every channel by default. A channel
+# can opt out - a news or music channel with idents between items is wrong
+# rather than nostalgic:
+#
+#   - number: 4
+#     name: "Music Videos"
+#     path: /media/retrobox/music-videos
+#     bumpers: false

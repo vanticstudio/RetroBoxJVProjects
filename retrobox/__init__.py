@@ -14,6 +14,11 @@ are isolated and imported lazily. This makes the interesting logic fully
 testable on any machine, not just on the box in front of a TV.
 """
 
-__version__ = "1.0.0"
+#: The single source of truth for the version of this box.
+#:
+#: pyproject.toml derives its own version from this attribute, and the
+#: release process requires the git tag to match it - there is a test that
+#: fails on a tagged commit if they disagree. Nothing else may hold a copy.
+__version__ = "1.0.3"
 
 __all__ = ["__version__"]

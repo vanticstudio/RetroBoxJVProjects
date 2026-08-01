@@ -1,0 +1,170 @@
+#cloud-config
+# >>> TEMPLATE-ONLY >>> (this block is removed when the answer file is rendered)
+#
+# Retro Box unattended installer - TEMPLATE. JV Projects.
+#
+# THIS FILE IS A TEMPLATE AND IT IS COMMITTED TO A PUBLIC REPO.
+# It contains PLACEHOLDERS. It must never contain a real hash or a real key.
+#
+# Generate the real answer file with:
+#
+#     installer/make-autoinstall.sh --ssh-key ~/.ssh/id_ed25519.pub
+#
+# which writes installer/autoinstall.yaml - gitignored, never committed.
+#
+# <<< TEMPLATE-ONLY <<<
+#
+# Retro Box unattended installer. JV Projects.
+# Target: Ubuntu Server 26.04 LTS ("Resolute Raccoon") amd64.
+#
+# ---------------------------------------------------------------------------
+# Four things in here are load-bearing. Do not "tidy" them.
+#
+#   1. There is NO `kernel:` section. On 26.04 the server installer now picks
+#      an OEM/HWE kernel from detected hardware, and subiquity raises a fatal
+#      AutoinstallError if an explicit kernel is ALSO requested. Adding
+#      `kernel: {flavor: generic}` turns this into an install that hard-fails
+#      on exactly the certified secondhand hardware this product targets.
+#
+#   2. There is NO `oem:` section. Its default is `auto`, and on 26.04 `auto`
+#      means enabled for Server. That automatic kernel/driver selection is the
+#      entire reason this product moved to 26.04. `oem: {install: false}` is
+#      the one line that switches it off. Never add it.
+#
+#   3. Every entry in `storage.layout.match` carries a `size` key. The
+#      presence of `size` (or `ssd`) is what activates subiquity's implicit
+#      "skip disks that have an in-use partition" filter - which is what stops
+#      the installer wiping the USB stick it booted from. A bare `match: {}`
+#      has no such protection and can destroy the installer stick.
+#
+#   4. The generated config.yaml carries an explicit `channels:` list AS WELL
+#      AS media_root + auto_channels. That is deliberate, see provision.sh.
+# ---------------------------------------------------------------------------
+
+autoinstall:
+  version: 1
+
+  locale: en_AU.UTF-8
+  keyboard:
+    layout: au
+
+  # --- Who the box is -------------------------------------------------------
+  # The hostname is load-bearing: mDNS follows the system hostname and
+  # http://retrobox.local/ is the only address this product documents.
+  #
+  # Setting it here also fixes a real chroot bug: scripts/install.sh tries to
+  # rename the box with hostnamectl, and hostnamectl (unlike systemctl) has no
+  # chroot guard - inside the installer it would talk to the LIVE INSTALLER's
+  # hostnamed and rename that instead of the target. It is guarded with
+  # `|| echo` so it is harmless, but the rename only actually lands because
+  # subiquity did it here first.
+  #
+  # The password is a crypt(3) SHA-512 hash. It MUST be single-quoted: it is
+  # full of '$' and YAML will otherwise mangle it.
+  # It is for LOCAL CONSOLE ACCESS ONLY - see `ssh:` below and installer/README.md.
+  identity:
+    realname: Retro Box
+    hostname: __HOSTNAME__
+    username: __USERNAME__
+    password: '__PASSWORD_HASH__'
+
+  # --- Remote access is key-only -------------------------------------------
+  # allow-pw: false is the single line that makes a shared, publicly-known
+  # console password safe. Someone standing at the box can log in. Someone on
+  # the network cannot, whatever they know.
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys:
+      - '__SSH_AUTHORIZED_KEY__'
+
+  # --- Disk -----------------------------------------------------------------
+  # Guided, whole-disk, no questions, unknown disk of unknown size.
+  #
+  # The ordered match list is tried top-down: prefer the largest internal SSD,
+  # else the largest disk of any kind. Both carry `size`, so both inherit the
+  # in-use-partition filter that excludes the stick we booted from.
+  #
+  # sizing-policy: all hands the whole volume group to root. Without it a 1 TB
+  # appliance disk gets a 100 GiB root and leaves the rest idle - wrong on a
+  # box whose only job is storing video.
+  storage:
+    layout:
+      name: lvm
+      sizing-policy: all
+      match:
+        - ssd: true
+          size: largest
+        - size: largest
+
+  # --- Network --------------------------------------------------------------
+  # Wired and wireless both configured. Wired wins when present (lower route
+  # metric); wireless is the automatic fallback.
+  #
+  # `optional: true` on every interface is the important part. It is what stops
+  # systemd-networkd-wait-online holding the boot up for its full timeout on a
+  # box with nothing plugged in. This box must boot and play with no network
+  # at all, so nothing here may ever block.
+  network:
+    version: 2
+    ethernets:
+      wired-en:
+        match:
+          name: "en*"
+        dhcp4: true
+        optional: true
+        dhcp4-overrides:
+          route-metric: 100
+      wired-eth:
+        match:
+          name: "eth*"
+        dhcp4: true
+        optional: true
+        dhcp4-overrides:
+          route-metric: 100
+__WIFI_BLOCK__
+  # git is needed twice over: to clone the product below, and by the dashboard's
+  # self-update, which shells out to git. scripts/install.sh never installs it.
+  packages:
+    - git
+    - ca-certificates
+
+  # --- Provisioning ---------------------------------------------------------
+  # These run in the INSTALLER environment with the installed system mounted at
+  # /target, so everything that touches the box is wrapped in
+  # `curtin in-target --`. Any non-zero exit aborts the install loudly, which is
+  # what we want: a box that fails visibly beats a box that boots black.
+  #
+  # All the real work happens here, at install time, NOT on first boot. That is
+  # deliberate: the goal is to walk away and come back to a FINISHED box. A
+  # first-boot installer would hand the customer a ten-minute apt+pip run, and
+  # would need the internet at the customer's site instead of at the bench.
+  #
+  # The heavy lifting lives in installer/provision.sh, taken from the clone, so
+  # it is version-controlled and shellcheck-able instead of being smuggled
+  # through a YAML heredoc.
+  late-commands:
+    # 1. The clone. /opt/retrobox is a fixed absolute path so it does not move
+    #    with the username. The self-updater derives its own location from
+    #    where the package is imported so any path works - but it must be a real
+    #    git clone whose remote is named origin, or `git fetch --tags` silently
+    #    fetches nothing and every future update rolls itself back.
+    - curtin in-target -- git clone https://github.com/vanticstudio/RetroBoxJVProjects.git /opt/retrobox
+
+    # 2. Pin a release, so a new box starts on a known tag and the update system
+    #    has a coherent starting point. The repo has no vX.Y.Z tags yet; until
+    #    it does, this stays on main and says so loudly rather than failing.
+    - curtin in-target -- /opt/retrobox/installer/pin-release.sh
+
+    # 3. Everything else.
+    - curtin in-target -- env RETROBOX_USER=__USERNAME__ RETROBOX_REPO_DIR=/opt/retrobox /opt/retrobox/installer/provision.sh
+
+  # If anything above fails the install has already aborted. Copy our log out
+  # to where a post-mortem will look for it. error-commands' own failures are
+  # ignored by subiquity, so the `|| true` is belt and braces.
+  error-commands:
+    - cp /target/var/log/retrobox-install.log /var/log/installer/ 2>/dev/null || true
+
+  # Leave the box off at the end so it can be unplugged from the bench and
+  # carried to the TV. Change to `reboot` to have it come straight back up.
+  shutdown: poweroff

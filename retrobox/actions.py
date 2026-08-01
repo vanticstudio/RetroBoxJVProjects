@@ -31,6 +31,7 @@ class Action(Enum):
     SLEEP = auto()          # cycle the sleep timer (30 -> 60 -> 90 -> off)
     SHUTDOWN = auto()       # shut the machine down cleanly (menu / dashboard)
     POWER = auto()          # toggle standby (blank screen)
+    RELOAD = auto()         # re-read config.yaml (the dashboard changed it)
     QUIT = auto()           # shut the application down entirely
 
 

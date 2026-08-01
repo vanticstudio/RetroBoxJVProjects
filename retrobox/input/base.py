@@ -27,6 +27,10 @@ class InputBackend(ABC):
         self._queue: "Queue[InputEvent]" = Queue()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        # Set by InputManager so the dashboard's input test can show which
+        # backend a press came from. Optional: a backend started on its own
+        # still works, it is simply not being watched.
+        self._observer = None
 
     def start(self, queue: "Queue[InputEvent]") -> None:
         """Begin reading events onto ``queue`` from a background thread."""
@@ -45,6 +49,15 @@ class InputBackend(ABC):
             self._thread = None
 
     def emit(self, event: InputEvent) -> None:
+        # The observer runs first and is wrapped, so the diagnostic can never
+        # delay or swallow a button press. The remote is the product; the
+        # diagnostic is a convenience.
+        observer = self._observer
+        if observer is not None:
+            try:
+                observer(self.name, event)
+            except Exception:  # noqa: BLE001
+                log.debug("input observer failed", exc_info=True)
         self._queue.put(event)
 
     @property

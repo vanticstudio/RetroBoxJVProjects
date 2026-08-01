@@ -14,7 +14,7 @@ network-facing surface is Flask's, not this.
 Commands, one per connection, newline terminated::
 
     channel_up | channel_down | volume_up | volume_down | mute
-    info | guide | menu | last | sleep | power | shutdown
+    info | guide | menu | last | sleep | power | shutdown | reload
     channel <number>
 """
 
@@ -46,6 +46,9 @@ _SIMPLE = {
     "sleep": Action.SLEEP,
     "power": Action.POWER,
     "shutdown": Action.SHUTDOWN,
+    # Not a remote button: the dashboard sends this after it rewrites
+    # config.yaml, so the running TV picks the change up without a restart.
+    "reload": Action.RELOAD,
 }
 
 

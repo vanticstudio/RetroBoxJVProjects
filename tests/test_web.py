@@ -5,7 +5,7 @@ import time
 import pytest
 
 from retrobox import status as status_mod
-from retrobox.actions import Action
+from retrobox.actions import Action, InputEvent
 from retrobox.config import config_from_dict
 from retrobox.input.manager import InputManager
 from retrobox.input.web import WebBackend, parse_command
@@ -200,12 +200,13 @@ def client(tmp_path, runtime):
     return app.test_client()
 
 
-def test_index_serves_the_page(client):
-    res = client.get("/")
-    assert res.status_code == 200
-    body = res.get_data(as_text=True)
-    assert "RETRO BOX" in body
-    assert "#4DFF5A" in body, "styled with the on-screen green"
+def test_both_pages_serve(client):
+    for path in ("/", "/dash"):
+        res = client.get(path)
+        assert res.status_code == 200, path
+        body = res.get_data(as_text=True)
+        assert "RETRO BOX" in body, path
+        assert "#4DFF5A" in body, f"{path} is styled with the on-screen green"
 
 
 def test_status_route_reports_offline_when_the_tv_is_not_running(client):
@@ -359,3 +360,84 @@ def test_status_writing_does_not_disturb_the_menu(tmp_path, runtime, monkeypatch
     assert player.paused is True, "playback stayed paused"
     assert player.overlays[7] == before, "the menu was not redrawn under it"
     assert status_mod.read_status()["menu_open"] is True
+
+
+# ==========================================================================
+# What the now-playing page needs in the snapshot
+# ==========================================================================
+def test_status_carries_the_playback_position(tmp_path, runtime):
+    app, player, clock = build_app(tmp_path)
+    app.start()
+    player.time_pos = 431.5
+    app.step()
+
+    data = status_mod.read_status()
+    assert data["position"] == 431.5
+
+
+def test_status_carries_the_whole_lineup(tmp_path, runtime):
+    # The viewer page shows what is on the other channels. It reads the status
+    # file like everything else - the web process never builds a lineup itself.
+    app, player, clock = build_app(tmp_path)
+    app.start()
+    app.step()
+
+    lineup = status_mod.read_status()["lineup"]
+    assert [(c["number"], c["name"]) for c in lineup] == [
+        (2, "Adult Swim"), (3, "MTV Classic"), (4, "Late Night"),
+    ]
+    assert all("off_air" in c for c in lineup)
+
+
+def test_duration_is_only_reported_when_it_is_already_known(tmp_path, runtime, monkeypatch):
+    # Nothing in the two-second status loop is allowed to fork ffprobe.
+    from retrobox import probe
+
+    def explode(*a, **k):
+        raise AssertionError("the status snapshot ran ffprobe")
+
+    monkeypatch.setattr(probe, "_run_probe", explode)
+    app, player, clock = build_app(tmp_path)
+    app.start()
+    app.step()
+    assert status_mod.read_status()["duration"] is None
+
+    monkeypatch.setattr(probe, "cached_media", lambda p: probe.MediaInfo(1320.0, True))
+    clock.advance(5)
+    app.step()
+    assert status_mod.read_status()["duration"] == 1320.0
+
+
+# ==========================================================================
+# The input test needs the presses to reach the dashboard
+# ==========================================================================
+def test_status_carries_recent_button_presses(tmp_path, runtime):
+    app, player, clock = build_app(tmp_path)
+    app.start()
+    app.input.put(InputEvent(Action.CHANNEL_UP))
+    app.step()
+
+    presses = status_mod.read_status()["input"]["recent"]
+    assert presses[-1]["action"] == "CHANNEL_UP"
+    assert presses[-1]["backend"] == "dashboard"
+
+
+def test_status_says_which_input_backends_are_live(tmp_path, runtime):
+    app, player, clock = build_app(tmp_path)
+    app.start()
+    app.step()
+    assert status_mod.read_status()["input"]["backends"] == []
+
+
+def test_a_press_is_published_without_waiting_for_the_next_tick(tmp_path, runtime):
+    # "Press a button, see it light up" is the whole point of the input test.
+    # Waiting out the two-second status interval makes it feel broken.
+    app, player, clock = build_app(tmp_path)
+    app.start()
+    app.step()
+    before = len(status_mod.read_status()["input"]["recent"])
+
+    app.input.put(InputEvent(Action.MUTE))
+    app.step()                                    # no clock.advance
+    after = status_mod.read_status()["input"]["recent"]
+    assert len(after) == before + 1, "the press had to wait for the status timer"

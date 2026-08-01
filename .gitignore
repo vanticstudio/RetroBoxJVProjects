@@ -13,11 +13,34 @@ venv/
 # Each install has its own config (the installer creates it from
 # config.example.yaml). Keep personal configs out of the repo.
 config.yaml
+# The once-only copy of the config from before automation first edited it.
+config.yaml.bak
 # Generated filler clips (created by `retrobox --generate-assets`).
 retrobox/assets/*.mp4
 # ...but the boot splash is a source asset, not a generated one.
 !retrobox/assets/boot_splash.mp4
 
+# --- Unattended installer credentials ----------------------------------------
+# THIS REPO IS PUBLIC.
+#
+# installer/autoinstall.yaml.template is committed and holds only placeholders.
+# The rendered answer file holds a real password hash and a real SSH public key
+# and must never be committed. This rule and that template belong to the same
+# commit, so there is no window in which one exists without the other.
+#
+# Regenerate instead of recovering: installer/make-autoinstall.sh
+installer/autoinstall.yaml
+# Built boot media (multi-GB ISOs and stick images).
+installer/build/
+
 # OS cruft
 .DS_Store
 Thumbs.db
+# Update progress, written next to the config so a reloaded page can
+# pick a running update back up. Not something to commit.
+.retrobox-update.json
+# A network change on trial, written next to the config so the request that
+# keeps it can find the one that started it. It holds the previous contents
+# of the netplan files - which for wifi is the household's password - so it
+# is 0600 on the box and it never goes near this repository.
+.retrobox-network.json

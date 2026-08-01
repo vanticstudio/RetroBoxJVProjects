@@ -1,3 +1,6 @@
+import logging
+import os
+
 import pytest
 
 from retrobox.autochannels import (
@@ -253,7 +256,7 @@ start_channel: 2
     assert load_config(path).tune_in == "broadcast"
 
 
-def test_unwritable_config_still_yields_working_channels(tmp_path):
+def test_unwritable_config_still_yields_working_channels(tmp_path, caplog):
     root = _media(tmp_path, "sitcoms", "movies")
     config = config_from_dict(
         {"channels": [{"number": 2, "name": "A", "path": str(root / "sitcoms")}],
@@ -262,9 +265,13 @@ def test_unwritable_config_still_yields_working_channels(tmp_path):
     # A directory where a file should be: writing raises OSError.
     bad = tmp_path / "nope"
     bad.mkdir()
-    merged, added = apply_auto_channels(config, bad)
+    with caplog.at_level(logging.WARNING, logger="retrobox.autochannels"):
+        merged, added = apply_auto_channels(config, bad)
     assert [c.name for c in added] == ["Movies"]
     assert len(merged.channels) == 2, "the session still gets the channel"
+    assert any(r.levelno == logging.WARNING for r in caplog.records), (
+        "a config the box cannot write is worth saying out loud"
+    )
 
 
 def test_write_channels_with_nothing_to_add_is_a_no_op(tmp_path):
@@ -272,3 +279,69 @@ def test_write_channels_with_nothing_to_add_is_a_no_op(tmp_path):
     before = path.read_text()
     write_channels(path, [])
     assert path.read_text() == before
+
+
+# -- surviving the power going off ----------------------------------------
+def _staging_litter(directory):
+    return sorted(p.name for p in directory.iterdir() if p.name.endswith(".tmp"))
+
+
+def test_the_original_config_is_kept_the_first_time_channels_are_added(tmp_path):
+    root = _media(tmp_path, "sitcoms", "movies")
+    original = (
+        f'# hand written\nmedia_root: {root}\nauto_channels: true\nchannels:\n'
+        f'  - number: 2\n    name: "Sitcoms"\n    path: {root / "sitcoms"}\n'
+    )
+    path = _config_file(tmp_path, original)
+    apply_auto_channels(load_config(path), path)
+
+    assert (tmp_path / "config.yaml.bak").read_text() == original
+    assert "Movies" in path.read_text(), "and the real write still happened"
+
+
+def test_a_second_discovery_does_not_overwrite_the_backup(tmp_path):
+    root = _media(tmp_path, "sitcoms", "movies")
+    original = (
+        f'media_root: {root}\nauto_channels: true\nchannels:\n'
+        f'  - number: 2\n    name: "Sitcoms"\n    path: {root / "sitcoms"}\n'
+    )
+    path = _config_file(tmp_path, original)
+    apply_auto_channels(load_config(path), path)
+
+    # A new folder turns up later and gets written on a second start.
+    make_show(root, "cartoons", 2)
+    apply_auto_channels(load_config(path), path)
+
+    assert "Cartoons" in path.read_text(), "the second run really did write"
+    assert (tmp_path / "config.yaml.bak").read_text() == original, (
+        "the backup must still be the file from before automation ever ran"
+    )
+
+
+def test_a_write_that_dies_part_way_leaves_the_config_intact(tmp_path, caplog):
+    # The failure this whole change exists for: the box loses power between
+    # opening the config and finishing the write. The old file has to survive.
+    root = _media(tmp_path, "sitcoms", "movies")
+    original = (
+        f'media_root: {root}\nauto_channels: true\nchannels:\n'
+        f'  - number: 2\n    name: "Sitcoms"\n    path: {root / "sitcoms"}\n'
+    )
+    path = _config_file(tmp_path, original)
+
+    def power_cut(src, dst):
+        raise OSError("power cut")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "replace", power_cut)
+        with caplog.at_level(logging.WARNING, logger="retrobox.autochannels"):
+            merged, added = apply_auto_channels(load_config(path), path)
+
+    assert path.read_text() == original, "the config was truncated or rewritten"
+    assert _staging_litter(tmp_path) == [], "a failed write left a temp file behind"
+    assert not (tmp_path / "config.yaml.bak").exists(), (
+        "a backup that never completed must not be left as the last known good"
+    )
+    # ...and the box carries on: best effort means the channels still work.
+    assert [c.name for c in added] == ["Movies"]
+    assert len(merged.channels) == 2
+    assert any(r.levelno == logging.WARNING for r in caplog.records)

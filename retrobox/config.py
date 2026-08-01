@@ -8,12 +8,15 @@ config still produces a working television.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from .daypart import Daypart, DaypartError, parse_clock
+
+log = logging.getLogger(__name__)
 
 
 # Video containers we consider "an episode" when scanning a channel folder.
@@ -45,10 +48,101 @@ TUNE_IN_MODES = ("random", "resume", "broadcast")
 #   static - classic analog snow
 TRANSITION_EFFECTS = ("glitch", "static", "none")
 
+#: The clip that plays when the box is switched on. Shipped in
+#: retrobox/assets, and ON by default - a Retro Box shows its own branding at
+#: power-up without anybody having to ask for it. Set `boot_splash: false` in
+#: config.yaml to go straight to a channel instead.
+DEFAULT_BOOT_SPLASH = "boot_splash.mp4"
+
+
 # What the sleep timer does when it runs out.
 #   standby - blank the screen but leave the box running (press power to wake)
 #   off     - shut the machine down cleanly, so it is safe to unplug
 SLEEP_ACTIONS = ("standby", "off")
+
+
+#: What the box runs to switch itself off, when the config does not say.
+DEFAULT_POWER_OFF_COMMAND: tuple[str, ...] = ("sudo", "poweroff")
+
+
+def _power_off_table() -> frozenset[tuple[str, ...]]:
+    """Every argv this box will ever accept as "switch the machine off".
+
+    ``power_off_command`` is the one config value that becomes the argument
+    list of a real ``subprocess.Popen`` (see ``app.py``), and the config it
+    comes from can be replaced wholesale from a dashboard with no password on
+    it. So this is a closed table and the check against it is a lookup - the
+    question asked of a value is "is this one of the commands that turn a
+    computer off", never "does this one look dangerous". Spotting dangerous
+    text is a game you lose once; a list you can read in full is not.
+
+    It is written as a cross product only because three short lists are easier
+    to keep honest than 126 lines of tuples. Nothing here comes from a request:
+    the program, where the distro put it, and whether sudo is in front are each
+    fixed here in the source.
+    """
+    # The programs. Everything else about a shutdown - "-h now", "-p" - is
+    # part of the entry, so no argument is ever accepted on its own.
+    verbs = (
+        ("poweroff",),
+        ("halt", "-p"),
+        ("systemctl", "poweroff"),
+        ("shutdown", "-h", "now"),
+        ("shutdown", "-P", "now"),
+    )
+    # sudo matches the literal command it is given and so does this table, so
+    # every place a distro might keep these binaries is spelled out: /sbin on
+    # older systems, /usr/sbin once /usr was merged, and the bare name for the
+    # ordinary PATH lookup the shipped config uses.
+    homes = ("", "/sbin/", "/usr/sbin/", "/bin/", "/usr/bin/")
+    # "-n" so sudo fails instead of waiting for a password nobody will type.
+    sudos = (
+        (), ("sudo",), ("sudo", "-n"), ("/usr/bin/sudo",), ("/usr/bin/sudo", "-n"),
+    )
+    # The empty argv is in here on purpose: `power_off_command: []` means the
+    # feature is off, which is how the test suite keeps from shutting a
+    # developer's laptop down, and it is the one value that runs nothing.
+    table = {()}
+    for sudo in sudos:
+        for verb in verbs:
+            for home in homes:
+                table.add(sudo + (home + verb[0],) + verb[1:])
+    return frozenset(table)
+
+
+#: The whitelist itself. Compare with ``in``; never pattern-match against it.
+POWER_OFF_COMMANDS: frozenset[tuple[str, ...]] = _power_off_table()
+
+
+def parse_power_off_command(raw: Any) -> tuple[str, ...]:
+    """Turn a ``power_off_command`` config value into an argv, or refuse it.
+
+    Raises :class:`ConfigError` for anything that is not in
+    :data:`POWER_OFF_COMMANDS`. Callers decide what to do about that - the
+    loader below keeps the box booting, the dashboard refuses the save.
+    """
+    if raw is None:
+        return DEFAULT_POWER_OFF_COMMAND
+    if isinstance(raw, str):
+        command = tuple(raw.split())
+    elif isinstance(raw, (list, tuple)):
+        command = tuple(str(item) for item in raw)
+    else:
+        raise ConfigError("'power_off_command' must be a string or list of strings")
+
+    if command not in POWER_OFF_COMMANDS:
+        # Quoted back so somebody reading the dashboard or the journal can see
+        # what was in the file, and clipped so a config full of junk cannot
+        # push a wall of it into an error message or a log line.
+        shown = " ".join(command)
+        shown = (shown[:120] + "...") if len(shown) > 120 else shown
+        raise ConfigError(
+            f"'power_off_command' is not a command this box will run: {shown}. "
+            f"It has to be a plain shutdown - e.g. [\"sudo\", \"poweroff\"], "
+            f"[\"sudo\", \"systemctl\", \"poweroff\"] or "
+            f"[\"sudo\", \"shutdown\", \"-h\", \"now\"] - or [] to disable it."
+        )
+    return command
 
 
 @dataclass(frozen=True)
@@ -74,6 +168,46 @@ class CrtConfig:
 
 
 @dataclass(frozen=True)
+class WebConfig:
+    """Limits on what the LAN dashboard is allowed to write to the disk.
+
+    Uploads are the one place an unauthenticated visitor can consume a
+    resource that does not come back, so both of these are guard rails against
+    a full filesystem - which on this box means a unit that will not boot.
+    """
+
+    max_upload_mb: int = 8192       # one very large film, and no more
+    min_free_mb: int = 1024         # refuse an upload that would go below this
+
+    # Chunked folder uploads. A whole series arrives as one session of many
+    # files, each cut into chunks so a dropped connection resumes rather than
+    # restarts. All four are caps rather than targets: an unbounded session
+    # count is a trivial way to spoil someone's evening.
+    chunk_mb: int = 8               # size of each piece a file is sent in
+    max_files_per_upload: int = 500  # a series, not an entire library
+    max_upload_sessions: int = 4    # how many uploads may run at once
+    upload_expiry_hours: int = 24   # abandoned chunks are reclaimed after this
+
+
+@dataclass(frozen=True)
+class UpdateConfig:
+    """Whether the box looks for new versions of itself, and what it may do.
+
+    ``check`` and ``auto_apply`` are deliberately separate. Checking is
+    harmless and useful - the dashboard can say an update is waiting. Applying
+    is not: the day a fleet self-applies, one bad tag takes out every unit at
+    once, in living rooms, with no way in to fix them because the dashboard
+    you would fix them from is on the box that is down. So checking is on and
+    applying is off, and turning applying on is a decision somebody makes
+    knowingly after the rollback has been proven on real hardware.
+    """
+
+    check: bool = True
+    auto_apply: bool = False
+    check_interval_hours: int = 24
+
+
+@dataclass(frozen=True)
 class ChannelConfig:
     """A single television channel backed by a folder of episodes."""
 
@@ -89,6 +223,9 @@ class ChannelConfig:
     # Wall-clock windows that override this channel's name, folder, or put it
     # off the air entirely (see daypart.py). Tested in order; first match wins.
     dayparts: tuple[Daypart, ...] = ()
+    # Whether station bumpers play between episodes on this channel. On by
+    # default; a news or music channel is often better without them.
+    bumpers: bool = True
 
     def __post_init__(self) -> None:
         if self.number < 0:
@@ -124,6 +261,8 @@ class Config:
     guide_seconds: float = 8.0            # how long the on-screen guide stays up
     ui: UiConfig = field(default_factory=UiConfig)
     crt: CrtConfig = field(default_factory=CrtConfig)
+    web: WebConfig = field(default_factory=WebConfig)
+    updates: UpdateConfig = field(default_factory=UpdateConfig)
 
     # Audio.
     initial_volume: int = 70              # 0-100
@@ -132,7 +271,13 @@ class Config:
     # Press volume-down once more when already at 0 to cleanly shut the machine
     # down (so it's safe to cut power). The command run to shut down:
     power_off_on_min_volume: bool = True
-    power_off_command: tuple[str, ...] = ("sudo", "poweroff")
+    power_off_command: tuple[str, ...] = DEFAULT_POWER_OFF_COMMAND
+    # Set when the file asked for a power_off_command this box will not run and
+    # the default was used instead. The TV ignores it - it has already been
+    # given a safe command - but the dashboard reads it to refuse *saving* a
+    # config like that, so nobody is quietly left with a setting they did not
+    # get. Holds the complaint, ready to show; None when all was well.
+    power_off_command_refused: Optional[str] = None
 
     # Sleep timer. Pressing the sleep button cycles through these durations (in
     # minutes) and then back to off; when the timer runs out the box does
@@ -248,6 +393,7 @@ def _parse_channels(raw: Any, base: Optional[Path], default_shuffle: bool) -> Li
                 dayparts=_parse_dayparts(
                     entry.get("dayparts"), base, f"channel {number} ('{name}')"
                 ),
+                bumpers=bool(entry.get("bumpers", True)),
             )
         )
     return channels
@@ -393,8 +539,13 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
     assets_dir_raw = data.get("assets_dir")
     assets_dir = _as_path(assets_dir_raw, base_dir) if assets_dir_raw else None
 
-    splash_raw = data.get("boot_splash")
-    boot_splash = _as_path(splash_raw, base_dir) if splash_raw else None
+    # Absent means "yes, the shipped one". `false`, `null` or an empty string
+    # mean "no splash at all" - the same spelling `sleep_timer: false` uses.
+    splash_raw = data.get("boot_splash", DEFAULT_BOOT_SPLASH)
+    boot_splash = (
+        None if splash_raw is False or splash_raw is None or splash_raw == ""
+        else _as_path(splash_raw, base_dir)
+    )
 
     start_channel = data.get("start_channel")
     start_channel = int(start_channel) if start_channel is not None else None
@@ -414,13 +565,21 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
     bumpers_raw = data.get("bumpers")
     bumpers_dir = _as_path(bumpers_raw, media_root or base_dir) if bumpers_raw else None
 
-    poff_raw = data.get("power_off_command", ["sudo", "poweroff"])
-    if isinstance(poff_raw, str):
-        power_off_command = tuple(poff_raw.split())
-    elif isinstance(poff_raw, list):
-        power_off_command = tuple(str(x) for x in poff_raw)
-    else:
-        raise ConfigError("'power_off_command' must be a string or list of strings")
+    # Deliberately not fatal, unlike every other bad value in this function.
+    # This box sits in somebody's living room with no SSH and no way back in;
+    # a config.yaml that refuses to load takes the picture away for good, and
+    # that is a far worse outcome than a power button behaving like the
+    # default one. So a command that is not on the whitelist is thrown away
+    # here - it can never reach subprocess.Popen - the default is used, and
+    # the refusal is carried on the Config so the dashboard (which does have
+    # somebody looking at it) can refuse to save such a config at all.
+    power_off_refused: Optional[str] = None
+    try:
+        power_off_command = parse_power_off_command(data.get("power_off_command"))
+    except ConfigError as exc:
+        power_off_refused = str(exc)
+        power_off_command = DEFAULT_POWER_OFF_COMMAND
+        log.warning("%s - using %s instead", exc, " ".join(power_off_command))
 
     return Config(
         channels=channels,
@@ -438,11 +597,14 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
         guide_seconds=_clamp_float(data.get("guide_seconds", 8.0), 0.0, 120.0, "guide_seconds"),
         ui=_parse_ui(data.get("ui")),
         crt=_parse_crt(data.get("crt")),
+        web=_parse_web(data.get("web")),
+        updates=_parse_updates(data.get("updates")),
         initial_volume=initial_volume,
         volume_step=volume_step,
         audio_device=audio_device,
         power_off_on_min_volume=bool(data.get("power_off_on_min_volume", True)),
         power_off_command=power_off_command,
+        power_off_command_refused=power_off_refused,
         sleep_steps=sleep_steps,
         sleep_action=sleep_action,
         bumpers_dir=bumpers_dir,
@@ -505,6 +667,51 @@ def _parse_crt(raw: Any) -> CrtConfig:
         scanlines=bool(raw.get("scanlines", d.scanlines)),
         scanline_intensity=_clamp_float(
             raw.get("scanline_intensity", d.scanline_intensity), 0.0, 1.0, "crt.scanline_intensity"
+        ),
+    )
+
+
+def _parse_web(raw: Any) -> WebConfig:
+    if raw is None:
+        return WebConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'web' must be a mapping")
+    d = WebConfig()
+    return WebConfig(
+        max_upload_mb=_clamp_int(
+            raw.get("max_upload_mb", d.max_upload_mb), 1, 128 * 1024, "web.max_upload_mb"
+        ),
+        min_free_mb=_clamp_int(
+            raw.get("min_free_mb", d.min_free_mb), 64, 1024 * 1024, "web.min_free_mb"
+        ),
+        chunk_mb=_clamp_int(raw.get("chunk_mb", d.chunk_mb), 1, 128, "web.chunk_mb"),
+        max_files_per_upload=_clamp_int(
+            raw.get("max_files_per_upload", d.max_files_per_upload),
+            1, 10_000, "web.max_files_per_upload",
+        ),
+        max_upload_sessions=_clamp_int(
+            raw.get("max_upload_sessions", d.max_upload_sessions),
+            1, 64, "web.max_upload_sessions",
+        ),
+        upload_expiry_hours=_clamp_int(
+            raw.get("upload_expiry_hours", d.upload_expiry_hours),
+            1, 24 * 30, "web.upload_expiry_hours",
+        ),
+    )
+
+
+def _parse_updates(raw: Any) -> UpdateConfig:
+    if raw is None:
+        return UpdateConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'updates' must be a mapping")
+    d = UpdateConfig()
+    return UpdateConfig(
+        check=bool(raw.get("check", d.check)),
+        auto_apply=bool(raw.get("auto_apply", d.auto_apply)),
+        check_interval_hours=_clamp_int(
+            raw.get("check_interval_hours", d.check_interval_hours),
+            1, 720, "updates.check_interval_hours",
         ),
     )
 
@@ -579,10 +786,16 @@ __all__ = [
     "ChannelConfig",
     "UiConfig",
     "CrtConfig",
+    "WebConfig",
+    "UpdateConfig",
     "ConfigError",
     "load_config",
     "config_from_dict",
+    "parse_power_off_command",
+    "DEFAULT_BOOT_SPLASH",
+    "DEFAULT_POWER_OFF_COMMAND",
     "DEFAULT_VIDEO_EXTENSIONS",
+    "POWER_OFF_COMMANDS",
     "TUNE_IN_MODES",
     "TRANSITION_EFFECTS",
     "SLEEP_ACTIONS",
