@@ -23,6 +23,7 @@ first.
 - **The box kept no log.** Every line this software wrote — what it loaded,
   which channel it changed to, what went wrong — was going to the console on
   the television instead of into the box's log, where nothing was reading it.
+  `journalctl -u retrobox` had never contained a single line from the
   programme itself. The cause was one setting the television needs in order to
   put a picture on the screen at all, which quietly changes where everything
   else is written to. It now keeps a proper log, which is how anything else on
