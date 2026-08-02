@@ -46,6 +46,19 @@ StandardInput=tty
 TTYPath=/dev/tty1
 TTYReset=yes
 TTYVHangup=yes
+# Both of these are here BECAUSE of StandardInput=tty above. systemd documents
+# that when StandardInput= is tty, StandardOutput= stops defaulting to the
+# journal and defaults to `inherit` instead - meaning it follows stdin onto
+# /dev/tty1. Every log line this program has ever written went to an unwatched
+# console and was lost: `journalctl -u retrobox` contained no "loading config",
+# no channel changes, no warnings, nothing. The only entries that ever appeared
+# came from libmpv's PipeWire logger, which talks to the journal itself, and
+# their presence is what made the journal look like it was working.
+#
+# That is not a tidy-up. It is the difference between a fault that gets
+# diagnosed and one that gets guessed at on hardware with no screen attached.
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

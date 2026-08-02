@@ -25,6 +25,8 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import stat as stat_mod
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -177,6 +179,9 @@ class WebBackend(InputBackend):
         super().__init__()
         self._path = Path(socket_path) if socket_path else control_socket_path()
         self._server: Optional[socket.socket] = None
+        #: The inode of the socket we bound, so we can tell "still ours" from
+        #: "something replaced it while we were listening".
+        self._inode: Optional[int] = None
 
     @staticmethod
     def is_available() -> bool:
@@ -188,10 +193,17 @@ class WebBackend(InputBackend):
     def socket_path(self) -> Path:
         return self._path
 
-    def _run(self) -> None:
+    #: How often to check the socket we bound is still the socket on disk.
+    #: Cheap - one stat() - and the interval only bounds how long the box is
+    #: deaf after something disturbs it, so it is not worth tuning finely.
+    REBIND_CHECK_SECONDS = 10.0
+
+    def _bind(self) -> socket.socket:
+        """Make the directory, clear anything stale, and listen."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        # A socket left behind by a crash would make bind() fail.
-        if self._path.exists():
+        # A socket left behind by a crash would make bind() fail. So would a
+        # plain file somebody dropped at the path.
+        if self._path.exists() or self._path.is_symlink():
             try:
                 self._path.unlink()
             except OSError:
@@ -206,10 +218,93 @@ class WebBackend(InputBackend):
             os.chmod(self._path, 0o600)
         except OSError:
             pass
+        try:
+            self._inode = self._path.stat().st_ino
+        except OSError:
+            self._inode = None
+        return server
+
+    def _orphaned(self) -> bool:
+        """Has our socket been removed from the filesystem, or replaced?
+
+        ``/run/user/<uid>`` belongs to logind, which tears it down and builds
+        it again around login sessions. When that happens underneath a running
+        service the listener survives with nothing on the filesystem pointing
+        at it, and every command the dashboard sends is refused against a path
+        that looks perfectly ordinary.
+
+        The test is deliberately only "is there a socket there at all", NOT "is
+        it the same inode we bound". Comparing inodes looks stricter and is
+        much worse: if anything else legitimately binds this path - a second
+        backend after a reload, a newer process during a restart - then we
+        unlink theirs, they unlink ours, and the two rebind over each other for
+        ever, ten seconds apart, with the box deaf the entire time. Measured on
+        the box, which is the only reason this comment exists. Yielding to
+        whoever holds the socket is always better than fighting for it: a
+        command reaching the other listener still reaches the television.
+        """
+        try:
+            info = self._path.stat()
+        except OSError:
+            return True                  # gone entirely
+        if not stat_mod.S_ISSOCK(info.st_mode):
+            return True                  # replaced by an ordinary file
+        # A socket file whose listener has gone still stats perfectly. The
+        # only honest way to tell a live listener from a corpse is to knock:
+        # a corpse refuses the connection. This is the reported fault exactly
+        # - a socket everybody could see and nobody answered - and it is also
+        # what keeps us from fighting a listener that IS alive.
+        return not self._anyone_listening()
+
+    def _anyone_listening(self) -> bool:
+        """Does a connection to our path get answered by anybody?"""
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.5)
+            probe.connect(str(self._path))
+            return True
+        except OSError:
+            return False
+        finally:
+            try:
+                probe.close()
+            except OSError:
+                pass
+
+    def _run(self) -> None:
+        server: Optional[socket.socket] = self._bind()
         self._server = server
         log.info("web control socket listening on %s", self._path)
+        next_check = time.monotonic() + self.REBIND_CHECK_SECONDS
 
         while not self.stopping:
+            now = time.monotonic()
+            if now >= next_check:
+                next_check = now + self.REBIND_CHECK_SECONDS
+                if server is None or self._orphaned():
+                    log.warning(
+                        "the control socket at %s has gone - binding a new "
+                        "one so the dashboard can reach the television again",
+                        self._path)
+                    if server is not None:
+                        try:
+                            server.close()
+                        except OSError:
+                            pass
+                    try:
+                        server = self._bind()
+                    except OSError:
+                        # Out of the way for now (the directory may be being
+                        # rebuilt underneath us); try again next time round.
+                        log.warning("could not rebind %s", self._path,
+                                    exc_info=True)
+                        server = None
+                    self._server = server
+
+            if server is None:
+                time.sleep(min(0.5, self.REBIND_CHECK_SECONDS))
+                continue
+
             try:
                 conn, _ = server.accept()
             except socket.timeout:
@@ -217,7 +312,17 @@ class WebBackend(InputBackend):
             except OSError:
                 if self.stopping:
                     break
-                raise
+                # Our end went while we were waiting on it - a reload closed
+                # it, or logind swept the directory. Never exit over this: a
+                # thread that stands down permanently leaves the box with no
+                # remote control at all until it is switched off at the wall.
+                # The watchdog decides what to do on the next pass, and it
+                # only rebinds when nothing is answering.
+                log.warning("the control socket stopped accepting",
+                            exc_info=True)
+                server = None
+                self._server = None
+                continue
             with conn:
                 self._serve(conn)
 

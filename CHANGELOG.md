@@ -10,6 +10,31 @@ you'd notice, it isn't here.
 The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), newest
 first.
 
+## [2.2.0] - 2026-08-02
+
+> **Worth running `./scripts/install-service.sh` once** after this update, from
+> the dashboard's **System** page or on the box. It replaces the two service
+> files, and one of the fixes below lives in them rather than in the code the
+> update replaces. Everything keeps working without it — you just won't get the
+> log.
+
+### Fixed
+
+- **The box kept no log.** Every line this software wrote — what it loaded,
+  which channel it changed to, what went wrong — was going to the console on
+  the television instead of into the box's log, where nothing was reading it.
+  programme itself. The cause was one setting the television needs in order to
+  put a picture on the screen at all, which quietly changes where everything
+  else is written to. It now keeps a proper log, which is how anything else on
+  this list gets diagnosed rather than guessed at.
+- **The dashboard's buttons could go permanently deaf.** The television and the
+  dashboard talk over a private connection which the box's own housekeeping can
+  remove from underneath them. When that happened everything looked healthy —
+  the connection was still listed, the television was still playing — and every
+  button, plus **Reload**, the picture preview and **Test sound**, silently did
+  nothing, until the box was switched off at the wall. The television now
+  notices its end has gone and rebuilds it within a few seconds, by itself.
+
 ## [2.1.0] - 2026-08-02
 
 ### Fixed

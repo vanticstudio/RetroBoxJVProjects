@@ -252,6 +252,34 @@ def environment(name):
     return out
 
 
+def test_the_television_writes_its_log_to_the_journal_not_the_console(tv):
+    """StandardInput=tty changes what StandardOutput defaults to.
+
+    systemd documents it: when StandardInput= is tty, StandardOutput= stops
+    defaulting to the journal and defaults to `inherit`, following stdin onto
+    /dev/tty1. This unit needs the tty to show video on it, so both output
+    streams have to be pinned back or every log line goes to an unwatched
+    console - which is exactly what happened, and it is how a dead control
+    socket went unnoticed on a box with no screen attached.
+    """
+    service = tv["Service"]
+    assert service.get("StandardInput") == "tty", (
+        "if this ever stops being tty the pinning below is no longer needed - "
+        "read the comment in the unit before deleting it"
+    )
+    assert service.get("StandardOutput") == "journal"
+    assert service.get("StandardError") == "journal"
+
+
+def test_the_dashboard_log_also_reaches_the_journal(web):
+    """The dashboard takes no tty, so it keeps systemd's own default - but if
+    it ever grows a StandardInput= the same trap applies to it too."""
+    service = web["Service"]
+    if service.get("StandardInput"):
+        assert service.get("StandardOutput") == "journal"
+        assert service.get("StandardError") == "journal"
+
+
 def test_both_units_look_in_the_same_runtime_directory():
     # They find each other through the status file and control socket under
     # XDG_RUNTIME_DIR. If these ever disagree, the dashboard goes deaf and the

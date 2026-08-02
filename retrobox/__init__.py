@@ -19,6 +19,6 @@ testable on any machine, not just on the box in front of a TV.
 #: pyproject.toml derives its own version from this attribute, and the
 #: release process requires the git tag to match it - there is a test that
 #: fails on a tagged commit if they disagree. Nothing else may hold a copy.
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 
 __all__ = ["__version__"]
