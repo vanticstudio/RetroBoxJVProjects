@@ -206,9 +206,12 @@ That lists every channel with its episode count, any dayparts, your bumper
 count and the sleep-timer ladder. A channel showing `NO EPISODES FOUND` has a
 wrong path or an unrecognised file extension.
 
-> Audio landed on the wrong output? `retrobox --list-audio` prints every device
-> and you can paste the HDMI one into `audio_device` in `config.yaml`. You can
-> also change it live from the on-screen menu.
+> Sound is worked out for you. The box reads which HDMI socket your television
+> is actually plugged into and uses that one, every time it starts — so a box
+> set up at a desk with no screen finds its sound the first time it meets a
+> television. If you ever need to override it, `retrobox --list-audio` prints
+> every device and `audio_device` in `config.yaml` takes one. **System → TEST
+> SOUND** on the dashboard plays a tone through whatever it chose.
 
 ### Step 5 — Get shows onto it
 
@@ -1242,7 +1245,8 @@ boot_splash: boot_splash.mp4   # the start-up clip; `false` for none
 
 initial_volume: 70       # 0-100
 volume_step: 5           # how much each volume press changes it
-audio_device: "alsa/hdmi:CARD=PCH,DEV=0"   # force HDMI audio
+audio_device: "alsa/hdmi:CARD=PCH,DEV=1"   # OPTIONAL - leave it out and the
+                         #   box reads which socket the TV is in and uses that
                          #   (`retrobox --list-audio` prints the names)
 
 bumpers: /path/to/clips  # station idents between episodes
@@ -1439,10 +1443,24 @@ that's what you restore.
 - **Video stutters** → hardware decode probably isn't active. Run `vainfo`; if
   it reports no driver, install `intel-media-va-driver` (newer Intel) or
   `i965-va-driver` (pre-Skylake).
-- **No sound** → run `retrobox --list-audio` and put an HDMI device name in
-  `audio_device` (or pick one from **Settings** on the dashboard, or from the
-  on-screen menu). Try the other `DEV=` numbers on the same card, or the
-  `alsa/plughw:CARD=...` variant.
+- **No sound** → open **System** on the dashboard and press **TEST SOUND**. If
+  you hear a tone, the box is fine and the problem is the television's input
+  or volume. If you don't, press **REPAIR PICTURE AND SOUND** — it looks for
+  the television's HDMI socket again, turns up anything muted, and tells you
+  what it changed.
+
+  The box normally sorts this out by itself. An Intel HDMI card has one output
+  per socket, and only the one with the television in it makes a noise —
+  opening any of the others succeeds and plays silence. So the box reads the
+  ELD each socket publishes (what the display sends back down the cable saying
+  what it is and what audio it accepts) and picks the one with a set on it. It
+  redoes this **every time it starts**, so a box built at a desk with no screen
+  attached finds its sound the first time you plug it into a television.
+
+  If the System page says *no display advertising audio is attached*, that is
+  the box telling you truthfully that no television is plugged in — check the
+  cable and that the set is switched on, then restart the box. Only set
+  `audio_device` by hand for the rare box that still gets it wrong.
 - **Remote does nothing** → confirm the Flirc is plugged into the box and was
   programmed ([Step 6](#step-6--program-the-remote)). Restart the box after
   plugging it in, and use **System → Remote test** to watch presses arrive.
@@ -1595,6 +1613,8 @@ retrobox/
 ├── menu.py        the on-screen menu (pure model, no display)
 ├── setup_wizard.py  interactive config builder (retrobox --setup)
 ├── hwdetect.py    GPU + HDMI audio detection (also runs standalone)
+├── eld.py         which HDMI socket the television is actually plugged into
+├── audioout.py    choosing an output from that, and unmuting it
 ├── daypart.py     wall-clock windows (rename / swap / sign off)
 ├── playlist.py    shuffle bag + sequential order
 ├── channel.py     folder scanning, tune-in modes, channel navigation

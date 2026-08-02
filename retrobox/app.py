@@ -280,6 +280,98 @@ class TVApp:
         # Clicks arrive on mpv's thread, so they are queued like end-of-file.
         self._clicks: "queue.Queue[tuple]" = queue.Queue()
         self.player.on_click = self._clicks.put
+        #: Which output the television is on and how it got there. Decided
+        #: at every start, never only at install - see set_up_audio.
+        self._audio_setup = self.set_up_audio()
+
+    # -- sound --------------------------------------------------------------
+    def set_up_audio(self):
+        """Choose an output, put the television on it, and unmute it.
+
+        Run at **every** start, not once at install. A box built on a bench
+        with no screen attached - because ethernet is faster for loading the
+        library - and later carried to a living room has to find its sound on
+        that boot, with nobody typing anything.
+
+        Never raises and never refuses to start. A box with no working audio
+        is still a box; it says so and plays the picture.
+        """
+        from . import audioout, eld
+
+        try:
+            sockets = eld.hdmi_outputs()
+        except Exception:  # noqa: BLE001 - an odd SBC, no /proc/asound
+            log.debug("could not read the HDMI sockets", exc_info=True)
+            sockets = []
+        try:
+            devices = self.player.list_audio_devices()
+        except Exception:  # noqa: BLE001
+            log.debug("the player would not list its outputs", exc_info=True)
+            devices = []
+
+        decision = audioout.decide(
+            self._audio_device, sockets=sockets, player_devices=devices)
+
+        if decision.device and decision.device != self._audio_device:
+            try:
+                self.player.set_audio_device(decision.device)
+                self._audio_device = decision.device
+            except Exception:  # noqa: BLE001
+                log.warning("could not switch audio output to %s",
+                            decision.device, exc_info=True)
+        try:
+            self.player.set_audio_channels(decision.layout)
+        except Exception:  # noqa: BLE001
+            log.debug("the player would not take a channel layout",
+                      exc_info=True)
+
+        if decision.source == "eld":
+            # Only when a set was genuinely found: HDMI controls are often
+            # muted at zero by default, and everything above looks healthy
+            # while producing silence.
+            live = [s for s in sockets if s.usable]
+            if live:
+                try:
+                    audioout.unmute(str(live[0].card_index))
+                except Exception:  # noqa: BLE001
+                    log.debug("could not unmute the HDMI output", exc_info=True)
+
+        log.info("%s", decision.summary)
+        return decision
+
+    def play_test_tone(self, *, seconds: float = 2.0) -> bool:
+        """Put a short tone through whatever output was chosen.
+
+        Somebody setting a box up in a living room has to be able to answer
+        "is it the box or is it the telly" without a terminal, and this is
+        the only way to do it. Works with nothing playing and while something
+        is playing: what was on is remembered and put back afterwards.
+        """
+        import threading
+
+        was_playing = self._playing_path
+        try:
+            position = self.player.get_time_pos() or 0.0
+        except Exception:  # noqa: BLE001
+            position = 0.0
+
+        if not self.player.play_test_tone(seconds=seconds):
+            return False
+
+        if was_playing is not None:
+            # keep_open=yes leaves mpv paused on the tone's last frame, so
+            # without this the picture stops on a black screen.
+            timer = threading.Timer(
+                seconds + 0.4, self._after_test_tone, (was_playing, position))
+            timer.daemon = True
+            timer.start()
+        return True
+
+    def _after_test_tone(self, path: Path, position: float) -> None:
+        try:
+            self.player.play(path, start=max(0.0, position))
+        except Exception:  # noqa: BLE001 - never leave the screen on a tone
+            log.warning("could not resume after the test tone", exc_info=True)
 
     # -- construction -------------------------------------------------------
     @classmethod
@@ -486,6 +578,16 @@ class TVApp:
             return
         if action == Action.CRT_CANCEL:
             self._cancel_crt_preview()
+            return
+        # Administrative too: somebody in a living room pressed REPAIR or
+        # TEST SOUND on the dashboard. Handled up here so they work while the
+        # menu is open, during the splash and in standby - a box that is
+        # silent is exactly the box somebody will be poking at.
+        if action == Action.AUDIO_SETUP:
+            self._audio_setup = self.set_up_audio()
+            return
+        if action == Action.TEST_TONE:
+            self.play_test_tone()
             return
         # Also administrative: the dashboard's Wake button, for when display
         # detection got it wrong, and the door a live viewer will hold the box
@@ -1538,6 +1640,46 @@ class TVApp:
             # Only the station ident changed - keep playing, reflash the bug.
             self.overlay.show_channel_bug(channel.number, name)
 
+    # -- what the player is actually doing ----------------------------------
+    def _audio_report(self) -> dict:
+        """The output mpv opened, not the one something hoped it opened."""
+        try:
+            live = self.player.get_audio_status() or {}
+        except Exception:  # noqa: BLE001 - a status snapshot is not worth one
+            log.debug("the player would not report its audio", exc_info=True)
+            live = {}
+        setup = self._audio_setup
+        return {
+            "device": live.get("device") or self._audio_device,
+            "ao": live.get("ao"),
+            # True/False once something with a soundtrack is playing, None
+            # when nothing is - which is an answer, not a failure.
+            "working": live.get("active"),
+            "channels": live.get("channels") or (setup.layout if setup else None),
+            "has_track": live.get("track"),
+            "source": setup.source if setup else None,
+            "summary": setup.summary if setup else None,
+            "monitor": setup.monitor_name if setup else None,
+        }
+
+    def _decode_report(self) -> dict:
+        """Which decoder is in use, and whether that is even knowable yet.
+
+        An idle television has not decided anything. Reporting "software
+        decode" for it - which is what a probe does - is how the System page
+        came to contradict the Watch tab on the same box at the same moment.
+        """
+        try:
+            hwdec = self.player.get_hwdec()
+        except Exception:  # noqa: BLE001
+            hwdec = None
+        playing = bool(self._playing_path)
+        return {
+            "hwdec": hwdec,
+            "playing": playing,
+            "working": bool(hwdec) if playing else None,
+        }
+
     # -- status snapshot ----------------------------------------------------
     def build_status(self) -> dict:
         """A cheap snapshot of what the box is doing, for the dashboard."""
@@ -1558,6 +1700,11 @@ class TVApp:
             "menu_open": self._menu is not None,
             "audio_device": self._audio_device,
             "hwdec": self.player.get_hwdec(),
+            # What the player is ACTUALLY doing, as opposed to what an
+            # external probe infers. The player made both choices, so no
+            # probe run from another process can be more correct than this.
+            "audio": self._audio_report(),
+            "decode": self._decode_report(),
             "display": self._display_status(),
             "sleep_minutes": (
                 None if remaining is None

@@ -35,6 +35,8 @@ class Action(Enum):
     CRT_PREVIEW = auto()    # try picture settings on the live screen, unsaved
     CRT_CANCEL = auto()     # throw the preview away, back to what was saved
     WAKE = auto()           # the box went quiet with nothing watching: bring it back
+    AUDIO_SETUP = auto()    # look for the television's HDMI socket again
+    TEST_TONE = auto()      # put a short tone through the chosen output
     QUIT = auto()           # shut the application down entirely
 
 

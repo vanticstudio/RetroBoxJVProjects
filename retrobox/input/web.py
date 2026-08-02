@@ -51,6 +51,12 @@ _SIMPLE = {
     # Not a remote button: the dashboard sends this after it rewrites
     # config.yaml, so the running TV picks the change up without a restart.
     "reload": Action.RELOAD,
+    # Not remote buttons either. A box built on a bench with no screen has no
+    # HDMI socket to choose, so it finds one at every start - and these two
+    # let the dashboard ask for that again, and prove the answer out loud,
+    # without anybody being sent to a terminal.
+    "audio_setup": Action.AUDIO_SETUP,
+    "test_tone": Action.TEST_TONE,
     # Not a remote button either. The box pauses the picture when it can see
     # that no television is watching; this brings it back, and holds it awake
     # for a while, for when that detection got it wrong. It is also the door a

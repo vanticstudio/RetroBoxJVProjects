@@ -245,35 +245,32 @@ def hardware() -> Dict[str, Any]:
         # the middle of a sentence about decoding.
         working: Optional[bool] = None
         summary = "Hardware decode: could not tell - no graphics detection on this machine"
-    elif report.decode_packages:
-        # A driver is expected for this GPU, so ask whether it actually works
-        # rather than assuming the install took.
-        try:
-            working = bool(hwdetect.check_vaapi())
-        except Exception:  # noqa: BLE001
-            working = None
-        if working:
-            summary = f"Hardware decode: working, {report.gpu_description}"
-        elif working is False:
-            summary = (
-                f"Hardware decode: not active on {report.gpu_description} - "
-                f"software decode is being used, which is fine on most files"
-            )
-        else:
-            summary = "Hardware decode: could not tell"
     else:
-        # No VA-API driver for this GPU. Not a fault; say so without alarm.
-        working = False
-        summary = (
-            f"Hardware decode: not available for {report.gpu_description}, "
-            f"using software decode - which is fine"
-        )
+        # build_report has already asked, and - critically - already knows the
+        # difference between "the GPU is not decoding" and "this process was
+        # not allowed to open the GPU to find out". Restating that here as a
+        # two-state bool is the bug that put "software decode is being used"
+        # on the System page of a box decoding with VA-API.
+        working = report.decode_working
+        summary = report.decode_summary
 
     return {
         "gpu_vendor": report.gpu_vendor,
         "gpu_description": report.gpu_description,
         "audio_devices": list(report.audio_devices),
-        "decode": {"working": working, "summary": summary},
+        "decode": {
+            "working": working,
+            "summary": summary,
+            "profiles": list(report.decode_profiles),
+        },
+        # This whole block is what the hardware CAN do and what is installed.
+        # It is not, and must never be presented as, what the television is
+        # doing right now - the player is asked for that.
+        "audio": {
+            "working": report.audio_working,
+            "summary": report.audio_summary,
+            "advice": report.audio_advice,
+        },
     }
 
 

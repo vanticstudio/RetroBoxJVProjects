@@ -2159,7 +2159,116 @@ def create_app(config_path: Optional[str] = None):
         # System page and in the support bundle, next to the free-space figure
         # it is the explanation for.
         report["trash"] = _trash_summary(config)
+        _let_the_player_win(report, status)
         return report
+
+    def _let_the_player_win(report: Dict[str, Any],
+                            status: Dict[str, Any]) -> None:
+        """Overlay what the television is DOING onto what a probe inferred.
+
+        The probe forks ``vainfo`` and ``aplay`` from this process. The
+        television opened the decoder and the audio device itself. When they
+        disagree the player is right by construction - it is reporting a
+        decision it made, not an inference about somebody else's - and the
+        disagreement is a bug in the probe, so it is logged as one.
+
+        This is not a tidy-up. On the bench box the Watch tab said
+        ``hw decode: vaapi`` while the System page said "software decode is
+        being used", at the same moment, about the same mpv.
+        """
+        hardware = report.get("hardware")
+        if not isinstance(hardware, dict):
+            return
+
+        live_decode = status.get("decode") if isinstance(status.get("decode"), dict) else {}
+        live_audio = status.get("audio") if isinstance(status.get("audio"), dict) else {}
+        probe_decode = hardware.get("decode") if isinstance(
+            hardware.get("decode"), dict) else {}
+
+        # -- picture --------------------------------------------------------
+        decode = dict(probe_decode)
+        decode["probe_working"] = probe_decode.get("working")
+        decode["source"] = "probe"
+        if live_decode:
+            if not live_decode.get("playing"):
+                # Nothing is playing, so there is no decoder in use to report.
+                # Passing the probe's guess off as live state is what started
+                # all of this.
+                decode["source"] = "idle"
+                decode["working"] = None
+                decode["summary"] = (
+                    "Picture: nothing is playing, so there is no decoder in "
+                    "use to report. "
+                    + _capability_sentence(probe_decode))
+            else:
+                using = live_decode.get("hwdec")
+                decode["source"] = "player"
+                decode["working"] = bool(using)
+                decode["hwdec"] = using
+                decode["summary"] = (
+                    f"Picture: the television is decoding with {using}"
+                    if using else
+                    "Picture: the television is decoding in software")
+                if probe_decode.get("working") is False and using:
+                    log.warning(
+                        "hardware probe says VA-API is not active but the "
+                        "television is decoding with %s - trusting the "
+                        "player. The probe could not see the GPU; check that "
+                        "this service has the 'render' and 'video' groups.",
+                        using)
+                    decode["disagreed"] = True
+        hardware["decode"] = decode
+
+        # -- sound ----------------------------------------------------------
+        probe_audio = hardware.get("audio") if isinstance(
+            hardware.get("audio"), dict) else {}
+        sound = dict(probe_audio)
+        sound["probe_working"] = probe_audio.get("working")
+        sound["source"] = "probe"
+        if live_audio:
+            sound["source"] = "player"
+            sound["device"] = live_audio.get("device")
+            sound["channels"] = live_audio.get("channels")
+            sound["setup"] = live_audio.get("summary")
+            working = live_audio.get("working")
+            sound["working"] = working
+            if live_audio.get("has_track") is False:
+                sound["summary"] = ("Sound: what is playing has no soundtrack "
+                                    "in it - nothing is wrong")
+            elif working is True:
+                where = live_audio.get("device") or "its chosen output"
+                sound["summary"] = f"Sound: the television is playing through {where}"
+            elif working is False:
+                # The setup line is already a whole sentence beginning
+                # "Sound:", so it is spliced in rather than stacked on top of
+                # a second prefix.
+                why = (live_audio.get("summary") or "")
+                if why.startswith("Sound: "):
+                    why = why[len("Sound: "):]
+                sound["summary"] = (
+                    "Sound: the television could not open an audio output"
+                    + (f" - {why}" if why else "."))
+            else:
+                sound["summary"] = (live_audio.get("summary")
+                                    or probe_audio.get("summary") or "")
+            if probe_audio.get("working") is False and working:
+                log.warning(
+                    "hardware probe found no audio outputs but the television "
+                    "is playing through %s - trusting the player. The probe "
+                    "could not see the sound card; check that this service "
+                    "has the 'audio' group.", live_audio.get("device"))
+                sound["disagreed"] = True
+        hardware["sound"] = sound
+
+    def _capability_sentence(probe_decode: Dict[str, Any]) -> str:
+        """What the hardware CAN do, said as capability rather than as state."""
+        profiles = probe_decode.get("profiles") or []
+        if profiles:
+            short = ", ".join(str(p).replace("VAProfile", "") for p in profiles[:6])
+            return f"This box can hardware-decode: {short}."
+        if probe_decode.get("working") is None:
+            return "Whether this box can hardware-decode could not be checked."
+        return "This box has no hardware decoder available."
 
     def _trash_summary(config: Optional[Config]) -> Dict[str, Any]:
         """What the trash is holding, or zeroes. Never raises: this is a GET."""
@@ -2181,6 +2290,79 @@ def create_app(config_path: Optional[str] = None):
     @app.get("/api/system")
     def api_system():
         return jsonify(_system_report())
+
+    @app.post("/api/system/hardware/repair")
+    def api_hardware_repair():
+        """Re-run detection, re-probe the sound, and say what changed.
+
+        Deliberately grants itself no new powers. This page has no login, so
+        a route that could apt-install as root would be an unauthenticated
+        root vector on every box on the network. Everything that actually
+        went wrong on the bench box is fixable without one: the HDMI socket
+        is chosen from the kernel's own ELD, the mixer is unmuted, and the
+        television is asked to look again. Anything that genuinely needs a
+        package is NAMED here and installed by the installer or the update,
+        which is also why this never tells anybody to open a terminal.
+
+        Safe to press twice: it re-reads and re-applies, and re-applying the
+        same answer changes nothing.
+        """
+        from . import audioout, hwdetect
+
+        changed: List[str] = []
+        before = _system_report().get("hardware") or {}
+
+        try:
+            report = hwdetect.build_report(run_install=False)
+        except Exception as exc:  # noqa: BLE001 - a repair must never 500
+            log.warning("hardware repair could not detect", exc_info=True)
+            return jsonify({"ok": False,
+                            "error": _for_a_customer(exc, action="hardware")}), 200
+
+        # Unmute whatever the card has. HDMI outputs are routinely muted at
+        # zero from cold, and everything above looks healthy while silent.
+        try:
+            unmuted = audioout.unmute()
+        except Exception:  # noqa: BLE001
+            unmuted = []
+        if unmuted:
+            changed.append(f"turned the volume up on {', '.join(unmuted)}")
+
+        # Ask the television to look for its socket again. It is the process
+        # with the audio group, so its answer is the one that counts.
+        if send_command("audio_setup"):
+            changed.append("asked the television to look for the sound again")
+        else:
+            changed.append("the television is not running, so it was not asked")
+
+        advice = report.audio_advice or ""
+        if report.decode_working is False and report.decode_packages:
+            advice = (advice + " The graphics driver "
+                      f"({', '.join(report.decode_packages)}) is not decoding; "
+                      "an update will reinstall it.").strip()
+
+        after = _system_report().get("hardware") or {}
+        return jsonify({
+            "ok": True,
+            "changed": changed,
+            "advice": advice,
+            "before": (before.get("sound") or {}).get("summary"),
+            "hardware": after,
+        })
+
+    @app.post("/api/system/sound/test")
+    def api_sound_test():
+        """Play a short tone, so 'is it the box or the telly' is answerable."""
+        if not send_command("test_tone"):
+            return jsonify({
+                "ok": False,
+                "error": ("The television is not running, so it cannot play a "
+                          "tone. Switch the box off at the wall and on again."),
+            }), 200
+        return jsonify({
+            "ok": True,
+            "note": "Listen to the television - a two second tone is playing.",
+        })
 
     @app.get("/api/system/logs")
     def api_system_logs():
@@ -3732,7 +3914,12 @@ async function refresh() {
       const bits = [s.muted ? 'muted' : ('volume ' + s.volume)];
       if (s.now_playing) bits.push(s.now_playing);
       if (s.sleep_minutes) bits.push('sleep ' + s.sleep_minutes + 'm');
-      bits.push(s.hwdec ? ('hw decode: ' + s.hwdec) : 'software decode');
+      /* An idle television has not chosen a decoder, so it is not "software
+         decode" - it is nothing yet. Calling it software decode here is the
+         same mistake the System page used to make in the other direction. */
+      const d = s.decode || {};
+      if (d.playing === false) bits.push('nothing playing');
+      else bits.push(s.hwdec ? ('hw decode: ' + s.hwdec) : 'software decode');
       $('#meta').textContent = bits.join('  \\u00b7  ');
     }
   } catch (e) { /* keep the last good render */ }
@@ -5023,6 +5210,51 @@ const fact = (key, value, tone) => {
   return row;
 };
 
+/* The two buttons that turn a diagnosis into something a customer can act
+   on. REPAIR re-runs detection, unmutes the outputs and asks the television
+   to look for its HDMI socket again; TEST SOUND puts a two second tone
+   through whatever it chose, which is the only way to answer "is it the box
+   or is it the telly" from a sofa. Both are safe to press twice. */
+function repairRow() {
+  const row = el('div', 'fact');
+  row.append(el('span', 'key', ''));
+  const holder = el('span', 'val');
+  const repair = el('button', 'small', 'REPAIR PICTURE AND SOUND');
+  const tone = el('button', 'small', 'TEST SOUND');
+  const said = el('span', 'note', '');
+  const busy = (on) => { repair.disabled = on; tone.disabled = on; };
+
+  repair.onclick = async () => {
+    busy(true);
+    said.textContent = ' checking the hardware...';
+    try {
+      const done = await api('/api/system/hardware/repair', {method: 'POST'});
+      if (!done.ok) { said.textContent = ' ' + (done.error || 'could not repair'); }
+      else {
+        const bits = (done.changed || []);
+        if (done.advice) bits.push(done.advice);
+        said.textContent = ' ' + (bits.join('; ') || 'nothing needed changing');
+        loadSystem();
+      }
+    } catch (e) { said.textContent = ' ' + e.message; }
+    busy(false);
+  };
+
+  tone.onclick = async () => {
+    busy(true);
+    said.textContent = ' playing a tone...';
+    try {
+      const done = await api('/api/system/sound/test', {method: 'POST'});
+      said.textContent = ' ' + (done.ok ? done.note : (done.error || 'no tone'));
+    } catch (e) { said.textContent = ' ' + e.message; }
+    busy(false);
+  };
+
+  holder.append(repair, tone, said);
+  row.append(holder);
+  return row;
+}
+
 function duration(seconds) {
   if (!seconds) return 'unknown';
   seconds = Math.floor(seconds);
@@ -5076,9 +5308,22 @@ async function loadSystem() {
     : 'empty', bin.items ? 'warn' : ''));
 
   const hw = s.hardware || {};
-  host.append(fact('Picture', (hw.decode || {}).summary || 'unknown',
-    (hw.decode || {}).working === false ? 'warn' : ''));
-  host.append(fact('Sound', (hw.audio_devices || []).join(', ') || 'no HDMI audio found'));
+  /* Both lines now say what the TELEVISION is doing, not what a probe run
+     from this process inferred. The probe kept its job - what the hardware
+     can do and what is installed - but it lost the right to state live
+     facts, having once told a customer their box was decoding in software
+     while the Watch tab showed vaapi on the same box at the same moment. */
+  const dec = hw.decode || {}, snd = hw.sound || {};
+  host.append(fact('Picture', dec.summary || 'unknown',
+    dec.working === false ? 'warn' : ''));
+  host.append(fact('Sound', snd.summary ||
+    (hw.audio_devices || []).join(', ') || 'no HDMI audio found',
+    snd.working === false ? 'warn' : ''));
+  if (snd.setup && snd.setup !== snd.summary) host.append(fact('', snd.setup));
+  if (snd.advice) host.append(fact('', snd.advice, 'warn'));
+  /* A diagnosis with no action is the same as broken, for somebody who does
+     not have - and must never be asked for - a terminal. */
+  host.append(repairRow());
   if (s.temperature) host.append(fact('Temperature', s.temperature.celsius + ' \\u00b0C'));
   if (s.load) {
     host.append(fact('Load', s.load.one_minute + ' over ' + s.load.cores + ' cores',

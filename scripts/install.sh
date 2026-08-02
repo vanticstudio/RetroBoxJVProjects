@@ -416,6 +416,13 @@ if [[ "${PLATFORM}" == "pc" ]]; then
       PACKAGES+=("$candidate")
     fi
   done
+  # Intel HDA/SOF audio firmware. Unconditional on a PC and one line: this
+  # chipset generation is routinely claimed by SOF, and without the firmware
+  # NO sound card registers at all - which reads on the System page as "no
+  # HDMI audio found" and gives the owner nothing to act on.
+  if have_package firmware-sof-signed; then
+    PACKAGES+=(firmware-sof-signed)
+  fi
 fi
 
 # HDMI-CEC, so the TV's own remote can drive the box. Standard on a Pi; on a PC
@@ -441,13 +448,33 @@ pip install --upgrade pip
 pip install -e "${REPO_DIR}[hardware,web]"
 
 if [[ "${PLATFORM}" == "pc" ]]; then
+  # The account has to be able to SEE the hardware before anything asks it
+  # about it. /dev/snd/* is root:audio 0660 and /dev/dri/renderD128 is
+  # root:render 0660, so without these groups `aplay -L` answers "no
+  # soundcards found" and `vainfo` cannot open the GPU at all - and the
+  # detector below then reports a box with perfectly good HDMI audio and
+  # working VA-API as having neither. The two services declare these groups
+  # for themselves; this is for the account, so that running the detector by
+  # hand gives the same answer the box gives.
+  echo "==> Letting this account see the sound card and the GPU"
+  sudo usermod -aG audio,video,render "${USER}" || \
+    echo "   (could not add ${USER} to audio/video/render - detection below" \
+         "may report less than this box can really do)"
+
   echo "==> Detecting graphics and HDMI audio hardware"
   # Deliberately placed AFTER the pip install above: this imports the freshly
   # installed retrobox package, so running it any earlier fails on import.
   # The venv is active at this point, so `python3` is the venv's interpreter.
   # --install lets it apt-install the VA-API driver matching the detected GPU.
-  python3 -m retrobox.hwdetect --install || \
-    echo "   (hardware detection failed - the box still works on software decode)"
+  #
+  # Run through `sg` so the groups just granted apply NOW rather than at the
+  # next login - otherwise this very step is the one that reports nothing.
+  if command -v sg > /dev/null 2>&1; then
+    sg audio -c "sg video -c 'sg render -c \"python3 -m retrobox.hwdetect --install\"'" || \
+      python3 -m retrobox.hwdetect --install || true
+  else
+    python3 -m retrobox.hwdetect --install || true
+  fi
 else
   echo "==> Skipping VA-API setup (the Pi decodes through V4L2, not VA-API)"
 fi
@@ -612,6 +639,29 @@ write_console_banners /etc
 if [[ "${INSTALL_SERVICE}" -eq 1 ]]; then
   echo "==> Installing systemd service"
   "${REPO_DIR}/scripts/install-service.sh"
+fi
+
+# What this box will ACTUALLY do, said out loud before anybody walks away.
+#
+# Deliberately never fatal. A box on software decode with no sound is still a
+# box, and some hardware genuinely cannot do better - but it must not be
+# possible to finish an install, see nothing but green ticks, and discover in
+# a living room that the television has no sound. Visible, not fatal.
+if [[ "${PLATFORM}" == "pc" ]]; then
+  echo
+  echo "==> What this box can actually do"
+  if command -v sg > /dev/null 2>&1; then
+    sg audio -c "sg video -c 'sg render -c \"python3 -m retrobox.hwdetect\"'" \
+      2>/dev/null | sed 's/^/    /' || true
+  else
+    python3 -m retrobox.hwdetect 2>/dev/null | sed 's/^/    /' || true
+  fi
+  echo
+  echo "    If the sound line says no display is attached, that is expected on a"
+  echo "    box built with no television plugged in. It looks again every time it"
+  echo "    starts, so plug the set in and switch the box off and on - it will"
+  echo "    find the sound by itself. The dashboard's System page has a REPAIR"
+  echo "    button and a TEST SOUND button if it does not."
 fi
 
 closing_notes "${PLATFORM}" "${INSTALL_SERVICE}" "${MEDIA_ROOT}" "${REPO_DIR}"

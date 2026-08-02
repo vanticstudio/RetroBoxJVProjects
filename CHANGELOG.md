@@ -10,6 +10,52 @@ you'd notice, it isn't here.
 The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), newest
 first.
 
+## [2.1.0] - 2026-08-02
+
+### Fixed
+
+- **The television now has sound.** A box with nothing set for `audio_device`
+  was playing into the 3.5 mm headphone socket — the analog jack — because
+  that is what "let the computer choose" means on an Intel machine. Nothing
+  was plugged into it. The box now works out which HDMI socket your
+  television is actually in, by reading what the set itself sends back down
+  the cable, and plays through that one. It does this **every time it starts**,
+  so a box you set up on a desk with no screen attached finds its sound the
+  first time you plug it into a television. Nothing to configure.
+- **A 5.1 soundtrack is no longer silent on a stereo television.** Sending
+  five channels to a set that only accepts two isn't an error — it just makes
+  no noise, and nothing anywhere says why. The box now asks the television how
+  many channels it takes and mixes down to fit.
+- **The System page was telling you the opposite of the truth.** It reported
+  "no HDMI audio found" and "software decode is being used" on a box whose
+  television was playing with hardware decode at that moment. The page was
+  asking questions it had no permission to ask — it could not open the sound
+  card or the graphics chip — and stating the refusals as facts. It now
+  reports what the television is **actually doing**, asked of the television,
+  and the page has the access it needs to check the rest honestly.
+- **"Nothing is playing" is now an answer.** The Watch tab used to call an
+  idle box "software decode". It had not chosen anything yet.
+- **The right graphics driver for your chip.** The box was installing the
+  driver for pre-2015 Intel graphics alongside the modern one and hoping. It
+  now picks by which chip you actually have.
+- **Subtitles stay off.** An embedded subtitle track in an mkv could switch
+  itself on. A 1998 cable box did not have subtitles.
+
+### Added
+
+- **A REPAIR button and a TEST SOUND button**, on the System page. Repair
+  looks for your television's socket again, turns up anything that was muted
+  and says what it changed. Test sound plays a two-second tone, so you can
+  tell whether it is the box or the telly without touching a terminal. Both
+  are safe to press twice.
+- **The System page says what your box can and cannot do**, in full: the video
+  formats it can decode in hardware, and the ones it will have to do in
+  software. On this generation of Intel that means AV1 is software-only — no
+  setting changes that, it is the chip.
+- **The installer finishes by telling you what actually works** — picture and
+  sound, each with what to do about it. It never fails an install over it: a
+  box on software decode with no sound is still a box.
+
 ## [Unreleased]
 
 > **One thing to do by hand, once.** If your box was set up before this version,

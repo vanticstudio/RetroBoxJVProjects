@@ -250,10 +250,24 @@ display_sleep:
 # --- Audio -------------------------------------------------------------------
 initial_volume: 70        # 0-100
 volume_step: 5            # how much each volume press changes it
-# Force audio to a specific output - for a TV you want HDMI, not the analog
-# jack. Run `retrobox --list-audio` to see the names. On Intel machines the
-# HDMI outputs hang off the onboard HDA controller, so the card is usually PCH.
-# audio_device: "alsa/hdmi:CARD=PCH,DEV=0"   # try other DEV= for other ports
+# Which output the sound comes out of.
+#
+# LEAVE THIS ALONE and the box works it out for itself, every time it starts.
+# An Intel HDMI card exposes one output per socket - typically three - and
+# only the one with the television in it makes a noise; opening any of the
+# others succeeds, plays silently and reports no error at all. So the box
+# reads the ELD each socket publishes (the block of data a display sends back
+# down the cable saying what it is and what audio it accepts) and picks the
+# one that actually has a set plugged into it. That happens at every start,
+# not just at install, so a box built on a bench with no screen attached
+# finds its sound the first time it is plugged into a television.
+#
+# It also downmixes to what that display said it accepts. A 5.1 track sent to
+# a stereo-only set is not an error - it is silence.
+#
+# Set this only for the rare box that needs a hand. `retrobox --list-audio`
+# prints the names, and the System page shows what was chosen and why.
+# audio_device: "alsa/hdmi:CARD=PCH,DEV=1"
 
 # Pressing volume-down once more when already at 0 cleanly shuts the machine
 # down (needs the sudo rule from scripts/install-service.sh).

@@ -74,6 +74,50 @@ class Player(ABC):
         """The decoder actually in use, e.g. "vaapi", or None for software."""
         return None
 
+    def get_audio_status(self) -> dict:
+        """What the player's audio output is ACTUALLY doing, right now.
+
+        The player made the choice, so it is the only thing on the box that
+        knows the answer. An external probe can say what hardware exists and
+        what is installed; it cannot say which device was opened, and when
+        the two disagree the probe is the one that is wrong.
+
+        Keys, all of which may be None when there is nothing to report:
+
+        * ``device``  - the output that was opened, as the player names it.
+        * ``ao``      - the audio backend in use ("alsa", "pulse", ...).
+        * ``active``  - True when an output was genuinely opened and is
+          taking samples, False when opening it failed, None when nothing is
+          playing so there is nothing to have opened.
+        * ``channels``- the layout actually being sent to the sink.
+        * ``track``   - False when the file has no audio track at all, which
+          is not a fault and must not be reported as one.
+        """
+        return {"device": None, "ao": None, "active": None,
+                "channels": None, "track": None}
+
+    def list_audio_devices(self) -> List[dict]:
+        """Every output the player can see, as ``{name, description}``.
+
+        Asked of the player rather than of ``aplay`` because the player runs
+        as the service that actually holds the ``audio`` group.
+        """
+        return []
+
+    def set_audio_channels(self, layout: str) -> bool:
+        """Ask for a channel layout ("stereo", "5.1"). True when it took."""
+        return False
+
+    def play_test_tone(self, *, seconds: float = 2.0,
+                       frequency: int = 440) -> bool:
+        """Put a short tone through the selected output. True when it played.
+
+        There is no way to answer "is it the box or is it the telly" from a
+        living room without this, and telling the customer to open a terminal
+        is not an option.
+        """
+        return False
+
     def get_mouse_position(self) -> Optional[Tuple[float, float]]:
         """Pointer position as (x, y) fractions of the video surface.
 
@@ -162,6 +206,7 @@ class MpvPlayer(Player):
         fonts_dir: Optional[Path] = None,
         force_4_3: bool = True,
         audio_device: Optional[str] = None,
+        audio_channels: Optional[str] = None,
         extra_options: Optional[dict] = None,
     ) -> None:
         try:
@@ -215,7 +260,21 @@ class MpvPlayer(Player):
             cursor_autohide="always",
             # A pleasant, readable OSD font size relative to the window.
             osd_font_size=40,
+            # A 1998 cable box had no subtitles, so an embedded track must not
+            # switch itself on. sub-auto=no also stops mpv picking up a .srt
+            # sitting next to the episode.
+            sid="no",
+            sub_auto="no",
+            # Everything is decoded to PCM. A television is not an AV
+            # receiver: bitstreaming AC3/DTS/TrueHD to a set that cannot
+            # decode it is silence, and silence is the bug this exists to
+            # prevent. Somebody with a receiver can turn it back on.
+            audio_spdif="",
         )
+        if audio_channels:
+            # What the sink said it accepts, from its ELD. Sending 5.1 to a
+            # stereo-only set is not an error - it is silent.
+            options["audio_channels"] = audio_channels
         if audio_device:
             # Force audio to a specific output (e.g. HDMI) instead of mpv's
             # default (which can pick the wrong sink on a multi-output box).
@@ -503,6 +562,84 @@ class MpvPlayer(Player):
             return None
         return str(current)
 
+    def _property(self, name: str, default=None):
+        """One mpv property, or ``default``. Never raises.
+
+        Properties are unavailable at perfectly ordinary moments - nothing
+        loaded, output not yet initialised - and python-mpv signals that by
+        raising. A status snapshot is not worth an exception.
+        """
+        try:
+            value = getattr(self._mpv, name)
+        except Exception:  # noqa: BLE001
+            return default
+        return default if value is None else value
+
+    def get_audio_status(self) -> dict:
+        # audio-out-params is only populated once an output has actually been
+        # opened and is taking samples, which is exactly the question. An
+        # empty dict means mpv tried and did not get an output.
+        out = self._property("audio_out_params", {}) or {}
+        track = self._property("aid", None)
+        has_track = None if track is None else str(track) not in ("no", "False")
+        idle = bool(self._property("idle_active", False))
+
+        ao = self._property("current_ao", None)
+        if idle or not has_track:
+            # Nothing playing, or a file with no sound in it. Neither is a
+            # fault, and neither is evidence about the output.
+            active = None if idle else False
+        elif ao and str(ao) == "null":
+            # mpv's audio-fallback-to-null is on by default and it is what
+            # makes a broken output look healthy: the file plays, the clock
+            # runs, and the samples go nowhere. Left on deliberately, because
+            # refusing to play a picture over it would be worse - but it is
+            # reported as what it is, which is no sound.
+            active = False
+        else:
+            active = bool(out)
+
+        channels = out.get("hr-channels") or out.get("channels")
+        return {
+            "device": self._property("audio_device", None),
+            "ao": ao,
+            "active": active,
+            "channels": str(channels) if channels else None,
+            "track": has_track,
+        }
+
+    def list_audio_devices(self) -> List[dict]:
+        found = self._property("audio_device_list", []) or []
+        devices = []
+        for entry in found:
+            try:
+                devices.append({"name": str(entry.get("name", "")),
+                                "description": str(entry.get("description", ""))})
+            except AttributeError:
+                continue
+        return [d for d in devices if d["name"]]
+
+    def set_audio_channels(self, layout: str) -> bool:
+        try:
+            self._mpv.audio_channels = layout
+        except Exception:  # noqa: BLE001
+            log.debug("mpv would not take audio-channels=%s", layout,
+                      exc_info=True)
+            return False
+        return True
+
+    def play_test_tone(self, *, seconds: float = 2.0,
+                       frequency: int = 440) -> bool:
+        # lavfi is built into the ffmpeg mpv already links, so this needs no
+        # tone file on disk and no new dependency.
+        source = f"av://lavfi:sine=frequency={int(frequency)}:duration={seconds:g}"
+        try:
+            self._mpv.play(source)
+        except Exception:  # noqa: BLE001
+            log.warning("could not play the test tone", exc_info=True)
+            return False
+        return True
+
     def get_mouse_position(self) -> Optional[Tuple[float, float]]:
         try:
             pos = self._mpv.mouse_pos
@@ -556,6 +693,19 @@ class MockPlayer(Player):
         self.hwdec: Optional[str] = None
         #: Tests set this to a normalised (x, y) to simulate a pointer.
         self.mouse_position: Optional[Tuple[float, float]] = None
+        #: The channel layout asked for, and every layout ever asked for, so
+        #: a test can prove a 5.1 file was downmixed without a sound card.
+        self.audio_channels: Optional[str] = None
+        self.channel_layouts: List[str] = []
+        #: What a real player would report its output was doing. Tests set
+        #: this to stand in for mpv; the shape mirrors get_audio_status().
+        self.audio_status: dict = {"device": None, "ao": None, "active": None,
+                                   "channels": None, "track": None}
+        #: What the player can see. Empty is the honest default: a mock has
+        #: no sound card, exactly like a box with none.
+        self.audio_device_list: List[dict] = []
+        #: Every test tone played, as (seconds, frequency).
+        self.test_tones: List[Tuple[float, int]] = []
 
     # -- pause / audio / pointer -------------------------------------------
     def set_paused(self, paused: bool) -> None:
@@ -581,6 +731,31 @@ class MockPlayer(Player):
 
     def get_hwdec(self) -> Optional[str]:
         return self.hwdec
+
+    def get_audio_status(self) -> dict:
+        # The device the mock was actually told to use outranks whatever a
+        # test left in audio_status, so set_audio_device stays meaningful.
+        status = dict(self.audio_status)
+        if self.audio_device is not None and status.get("device") is None:
+            status["device"] = self.audio_device
+        if self.audio_channels is not None and status.get("channels") is None:
+            status["channels"] = self.audio_channels
+        return status
+
+    def list_audio_devices(self) -> List[dict]:
+        return list(self.audio_device_list)
+
+    def set_audio_channels(self, layout: str) -> bool:
+        self.audio_channels = layout
+        self.channel_layouts.append(layout)
+        self._log(f"AUDIO CHANNELS {layout}")
+        return True
+
+    def play_test_tone(self, *, seconds: float = 2.0,
+                       frequency: int = 440) -> bool:
+        self.test_tones.append((seconds, int(frequency)))
+        self._log(f"TEST TONE {frequency}Hz for {seconds}s")
+        return True
 
     def get_mouse_position(self) -> Optional[Tuple[float, float]]:
         return self.mouse_position if self.mouse_enabled else None

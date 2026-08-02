@@ -217,9 +217,14 @@ def test_hardware_is_summarised_in_a_sentence(monkeypatch):
             decode_packages=["intel-media-va-driver"],
             audio_devices=["alsa/hdmi:CARD=PCH"],
             recommended_audio_device="alsa/hdmi:CARD=PCH",
+            # The verdict is reached in build_report, which is the only place
+            # that can tell "the GPU is not decoding" apart from "this process
+            # was not allowed to open the GPU and ask". sysinfo carries it; it
+            # no longer re-derives it from a two-state bool.
+            decode_working=True,
+            decode_summary="Hardware decode: working, Intel UHD 630",
         ),
     )
-    monkeypatch.setattr(sysinfo.hwdetect, "check_vaapi", lambda: True)
 
     hw = sysinfo.hardware()
     assert hw["gpu_vendor"] == "intel"
@@ -246,6 +251,9 @@ def test_software_decode_is_described_as_fine_because_it_is(monkeypatch):
         lambda **k: HardwareReport(
             gpu_vendor="nvidia", gpu_description="NVIDIA GK107",
             decode_packages=[], audio_devices=[], recommended_audio_device=None,
+            decode_working=False,
+            decode_summary=("Hardware decode: not available for NVIDIA GK107, "
+                            "using software decode - which is fine"),
         ),
     )
     hw = sysinfo.hardware()
