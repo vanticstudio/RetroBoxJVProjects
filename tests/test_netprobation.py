@@ -13,15 +13,42 @@ import json
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from retrobox import netprobation
+from retrobox import configwrite, netconf, netprobation
 from retrobox.netconf import NetworkError
 from retrobox.netprobation import NetplanTry, Probation
 
 REPO = Path(__file__).resolve().parent.parent
+
+
+class FakeApply:
+    """Stands in for `netplan apply`, which reconfigures every interface.
+
+    Counted rather than ignored: putting the old file back and putting the old
+    file *into effect* are two different things, and only one of them gets the
+    customer's box back on the network.
+    """
+
+    def __init__(self):
+        self.calls = 0
+        self.fails = False
+
+    def __call__(self):
+        self.calls += 1
+        if self.fails:
+            raise NetworkError("netplan would not apply that")
+
+
+@pytest.fixture(autouse=True)
+def applied(monkeypatch):
+    """No test in this file may reconfigure the machine running the suite."""
+    fake = FakeApply()
+    monkeypatch.setattr(netconf, "apply_plan", fake)
+    return fake
 
 
 class FakeTry:
@@ -128,9 +155,26 @@ WAITS_FOR_ENTER = (
     "pathlib.Path(sys.argv[1]).write_text('confirmed' if line else 'hung up')\n"
 )
 
+#: The same stand-in, for a netplan that reads the newline and then refuses the
+#: configuration anyway. `netplan try` really does this: it applies, waits, and
+#: on ENTER runs `netplan apply` - which can fail on a plan that passed
+#: validation, so the newline arrives, the change is not kept, and the exit
+#: status is the only thing that says so. This is the failure the whole module
+#: exists for, so it needs a stand-in that actually produces it.
+REFUSES_TO_KEEP_IT = (
+    "import pathlib, signal, sys\n"
+    "signal.alarm(15)\n"
+    "line = sys.stdin.readline()\n"
+    "pathlib.Path(sys.argv[1]).write_text('confirmed' if line else 'hung up')\n"
+    "sys.exit(4)\n"
+)
 
-@pytest.fixture
-def dashboard(tmp_path, written):
+#: A netplan try that is over before anybody presses anything - which is what
+#: the box finds once netplan's own timeout has fired.
+ALREADY_GONE = "import sys\nsys.exit(0)\n"
+
+
+def _requests_like_the_dashboard(tmp_path, written, script, cls=Probation):
     """Probation objects built the way the dashboard builds them.
 
     A brand new one - and so a brand new NetplanTry - for every single
@@ -142,11 +186,11 @@ def dashboard(tmp_path, written):
     marker = tmp_path / "pressed-enter"
 
     def request():
-        return Probation(
+        return cls(
             state_path=tmp_path / "network-change.json",
             writer=written, reader=written.read,
             trier=NetplanTry(timeout_command=[
-                sys.executable, "-c", WAITS_FOR_ENTER, str(marker),
+                sys.executable, "-c", script, str(marker),
             ]),
             clock=clock, timeout=120,
         )
@@ -155,6 +199,25 @@ def dashboard(tmp_path, written):
     request.marker = marker
     request.record = tmp_path / "network-change.json"
     return request
+
+
+@pytest.fixture
+def dashboard(tmp_path, written):
+    return _requests_like_the_dashboard(tmp_path, written, WAITS_FOR_ENTER)
+
+
+@pytest.fixture
+def netplan_says_no(tmp_path, written):
+    """The same dashboard, against a netplan that will not keep the change."""
+    return _requests_like_the_dashboard(tmp_path, written, REFUSES_TO_KEEP_IT)
+
+
+def _wait_for(trier, handle, *, running, why):
+    """Wait until a real stand-in process has got where the test needs it."""
+    deadline = time.time() + 10
+    while trier.running(handle) is not running and time.time() < deadline:
+        time.sleep(0.01)
+    assert trier.running(handle) is running, why
 
 
 # ==========================================================================
@@ -258,6 +321,370 @@ def test_reverting_by_hand_puts_it_back_immediately(probation, written):
     assert probation._test_trier.cancelled == 1
     assert written.store["/etc/netplan/90-retrobox-wired.yaml"] == "the old one\n"
     assert probation.state()["phase"] == "reverted"
+
+
+# ==========================================================================
+# A keep is not undoable, so it has to be written down first
+#
+# `netplan try` commits the instant the newline reaches it and nothing after
+# that can take it back. This module's promise runs both ways: no path ends
+# with an unconfirmed change still in place, and no path takes away a change
+# somebody confirmed. The second half is the one that breaks if the record is
+# written only after the commit - a full disk or a root gone read-only (which
+# is what overlayroot leaves) loses it, the next start-up reads a record that
+# still says "testing", and the box quietly puts back settings the customer
+# had explicitly kept. Reverting is not the safe direction here: the box is on
+# the settings somebody asked for, looked at, and said yes to.
+# ==========================================================================
+def test_a_keep_netplan_has_already_taken_is_never_undone_at_the_next_start_up(
+    tmp_path, written, monkeypatch
+):
+    clock = Clock()
+    trier = FakeTry()
+    record = tmp_path / "network-change.json"
+    written.store[WIRED] = "the old one\n"
+    first = Probation(state_path=record, writer=written, reader=written.read,
+                      trier=trier, clock=clock, timeout=120)
+    first.begin({WIRED: PLAN}, note="x")
+
+    # The disk goes at the worst possible moment: after netplan has committed,
+    # which cannot be taken back, and before the box has finished writing down
+    # that it did.
+    real = configwrite.atomic_write_text
+
+    def the_disk_goes_once_it_is_kept(path, text, **kw):
+        if '"kept"' in text:
+            raise OSError("no space left on device")
+        return real(path, text, **kw)
+
+    monkeypatch.setattr(configwrite, "atomic_write_text",
+                        the_disk_goes_once_it_is_kept)
+    first.confirm()
+    assert trier.confirmed == 1, "netplan never took it, so this proves nothing"
+
+    # The dashboard comes back: a restart, or the wall switch and a boot.
+    reborn = Probation(state_path=record, writer=written, reader=written.read,
+                       trier=FakeTry(), clock=clock, timeout=120)
+    settled = reborn.state()
+
+    assert written.store[WIRED] == PLAN, (
+        "the box undid a network change the customer had explicitly kept, at "
+        "start-up, with nobody watching"
+    )
+    assert settled["phase"] != "reverted", settled
+
+
+def test_a_box_that_cannot_write_down_a_keep_does_not_press_enter_at_all(
+    probation, written, monkeypatch
+):
+    # The other side of the same ordering. If the record cannot be made
+    # durable there is still one moment when nothing has happened yet, and
+    # that is the moment to stop: netplan still has the old configuration to
+    # go back to, which is the direction this module always takes when it is
+    # unsure of anything.
+    written.store[WIRED] = "the old one\n"
+    probation.begin({WIRED: PLAN}, note="x")
+
+    def the_root_went_read_only(path, text, **kw):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(configwrite, "atomic_write_text", the_root_went_read_only)
+
+    with pytest.raises(NetworkError) as caught:
+        probation.confirm()
+
+    assert probation._test_trier.confirmed == 0, (
+        "netplan committed a change this box had no way of writing down, so "
+        "the next start-up will find a record saying it never happened and "
+        "take it away again"
+    )
+    assert written.store[WIRED] == "the old one\n", \
+        "it left an untested configuration on the disk for the next boot to keep"
+    assert "previous" in str(caught.value).lower() or \
+           "back" in str(caught.value).lower(), str(caught.value)
+
+
+def test_a_keep_still_reads_as_kept_to_the_page_that_asked_for_it(probation):
+    # None of the above may change what a working box tells the browser.
+    probation.begin({WIRED: PLAN}, note="x")
+    assert probation.confirm()["phase"] == "kept"
+    assert probation.state()["phase"] == "kept"
+
+
+def test_a_keep_the_box_stopped_halfway_through_still_stands_at_start_up(
+    tmp_path, written
+):
+    # The record a box leaves when the power goes in the window between
+    # writing down that it is keeping the change and netplan taking it. The
+    # customer pressed Keep - they had the page in front of them, on the new
+    # settings, to press it at all - so what is on the disk is what they asked
+    # for, and start-up must not treat "unfinished" as "never happened".
+    record = tmp_path / "network-change.json"
+    written.store[WIRED] = PLAN
+    record.write_text(json.dumps({
+        "phase": "keeping", "note": "x", "handle": "a-trial-that-has-gone",
+        "owner_pid": os.getpid(),
+        "previous": {WIRED: "the old one\n"},
+        "started_at": 1000.0, "timeout": 120,
+    }))
+    p = Probation(state_path=record, writer=written, reader=written.read,
+                  trier=FakeTry(), clock=Clock(), timeout=120)
+
+    settled = p.state()
+    assert settled["phase"] == "kept", settled
+    assert written.store[WIRED] == PLAN, "it took away a change somebody kept"
+    assert PASSPHRASE not in record.read_text()
+    assert "previous" not in json.loads(record.read_text())
+
+
+def test_a_keep_settled_at_start_up_is_also_put_into_effect(
+    tmp_path, written, applied
+):
+    """Marked kept is not the same as being used, and the gap has a customer in it.
+
+    The record only says "keeping" if the box stopped between writing that
+    down and netplan taking the newline. When it was the *dashboard* that
+    stopped rather than the box, netplan try's terminal died with it and
+    netplan has already put its own configuration back - so the settings the
+    box is running are the old ones while the record now calls the new ones
+    kept. Writing "kept" and stopping there leaves that gap open until
+    somebody switches the box off at the wall, which on settings that took it
+    off the network is a gap nobody can close.
+    """
+    record = tmp_path / "network-change.json"
+    written.store[WIRED] = PLAN
+    record.write_text(json.dumps({
+        "phase": "keeping", "note": "x", "handle": "a-trial-that-has-gone",
+        "owner_pid": os.getpid(),
+        "previous": {WIRED: "the old one\n"},
+        "started_at": 1000.0, "timeout": 120,
+    }))
+    p = Probation(state_path=record, writer=written, reader=written.read,
+                  trier=FakeTry(), clock=Clock(), timeout=120)
+
+    settled = p.state()
+    assert settled["phase"] == "kept", settled
+    assert applied.calls == 1, (
+        "the box was told its settings were kept while it went on running "
+        "the ones netplan put back"
+    )
+
+    # And only once: state() is what the page polls, so a settle that applied
+    # every time round would take the network down every couple of seconds.
+    p.state()
+    assert applied.calls == 1
+
+
+def test_a_keep_settled_at_start_up_that_would_not_apply_says_to_restart_the_box(
+    tmp_path, written, applied
+):
+    # The box is marked kept and is not using the settings. That is worth
+    # saying out loud, because switching it off and on again is the fix and
+    # nothing else is going to tell anybody.
+    applied.fails = True
+    record = tmp_path / "network-change.json"
+    written.store[WIRED] = PLAN
+    record.write_text(json.dumps({
+        "phase": "keeping", "note": "x", "handle": "a-trial-that-has-gone",
+        "owner_pid": os.getpid(),
+        "previous": {WIRED: "the old one\n"},
+        "started_at": 1000.0, "timeout": 120,
+    }))
+    p = Probation(state_path=record, writer=written, reader=written.read,
+                  trier=FakeTry(), clock=Clock(), timeout=120)
+
+    settled = p.state()
+    assert settled["phase"] == "kept", settled
+    assert settled.get("in_effect") is False, (
+        "nothing marks this record as one the page has to say something about"
+    )
+    assert "off and on" in settled["message"], settled["message"]
+
+
+def test_a_keep_that_was_already_undone_is_never_reported_as_kept(
+    tmp_path, written, applied
+):
+    """The record that says "keeping" over settings that were put back.
+
+    "keeping" is written down before the newline that commits the change, so
+    it is a statement of intent and not of fact. When the newline could not be
+    delivered the undo runs - it stops the trial and puts the netplan files
+    back - and only then writes down that it reverted. On a box whose media
+    partition is full, that last write is exactly the one that fails, and the
+    only record left on the disk is the "keeping" one from before.
+
+    Reading that as kept tells the customer their settings were saved while
+    the box sits on the old ones. The files are the thing that survived, so
+    they are what gets believed.
+    """
+    record = tmp_path / "network-change.json"
+    # The undo already put this back; only the record of it was lost.
+    written.store[WIRED] = "the old one\n"
+    record.write_text(json.dumps({
+        "phase": "keeping", "note": "x", "handle": "a-trial-that-has-gone",
+        "owner_pid": os.getpid(),
+        "previous": {WIRED: "the old one\n"},
+        "started_at": 1000.0, "timeout": 120,
+    }))
+    p = Probation(state_path=record, writer=written, reader=written.read,
+                  trier=FakeTry(), clock=Clock(), timeout=120)
+
+    settled = p.state()
+    assert settled["phase"] == "reverted", settled
+    assert "kept" not in settled["message"].lower(), (
+        f"it told the customer their settings were saved while the box runs "
+        f"the old ones: {settled['message']!r}"
+    )
+    assert written.store[WIRED] == "the old one\n"
+    # And what is on the disk is what the box is actually running.
+    assert applied.calls == 1
+
+
+def test_a_keep_whose_files_cannot_be_read_puts_the_previous_ones_back(
+    tmp_path, written, applied
+):
+    # Nothing can say which configuration is on the disk, so nothing can say
+    # whether the change was kept. Unsure always means back on this box: the
+    # previous settings are the ones that were known to work.
+    record = tmp_path / "network-change.json"
+    record.write_text(json.dumps({
+        "phase": "keeping", "note": "x", "handle": "a-trial-that-has-gone",
+        "owner_pid": os.getpid(),
+        "previous": {WIRED: "the old one\n"},
+        "started_at": 1000.0, "timeout": 120,
+    }))
+    p = Probation(state_path=record, writer=written,
+                  reader=lambda path: None,       # sudo cat would not run
+                  trier=FakeTry(), clock=Clock(), timeout=120)
+
+    settled = p.state()
+    assert settled["phase"] == "reverted", settled
+    assert written.store[WIRED] == "the old one\n", \
+        "it left the box on a configuration it could not account for"
+
+
+# ==========================================================================
+# Putting the file back is only half of putting it back
+#
+# netplan reads /etc/netplan at boot and when it is told to, and at no other
+# time. `netplan try` reverts what it *applied* when its terminal dies, but
+# nothing reverts what it applied when the dashboard was not there to hold
+# that terminal - a box that came up on a bad configuration, say. Rewriting
+# the file and stopping leaves that box running the settings nobody wanted
+# for the whole session, with no dashboard to try again from if those settings
+# are why it cannot be reached.
+# ==========================================================================
+def test_undoing_a_change_puts_the_old_settings_back_into_effect_too(
+    probation, written, applied
+):
+    written.store[WIRED] = "the old one\n"
+    probation.begin({WIRED: PLAN}, note="x")
+    probation.revert()
+
+    assert applied.calls == 1, (
+        "the file went back but the box goes on running the configuration "
+        "nobody wanted until somebody switches it off at the wall"
+    )
+
+
+def test_a_change_that_ran_out_of_time_is_put_back_into_effect_as_well(
+    probation, written, applied
+):
+    written.store[WIRED] = "the old one\n"
+    probation.begin({WIRED: PLAN}, note="x")
+    probation._test_clock.advance(121)
+    probation._test_trier.alive = False
+    probation.state()                          # noticing is what triggers it
+
+    assert applied.calls == 1
+
+
+def test_settings_that_would_not_go_back_are_never_put_into_effect(tmp_path, applied):
+    # The one case where applying would be the wrong move: a file that would
+    # not go back still holds the new configuration, so applying would make
+    # the untested one the live one - the exact opposite of an undo.
+    store = {WIRED: "the old one\n"}
+    jammed = {"now": False}
+
+    def write(path, content):
+        if jammed["now"]:
+            raise NetworkError("could not write the network configuration")
+        store[path] = content
+
+    p = _probation_with(tmp_path, write, store.get, FakeTry())
+    p.begin({WIRED: PLAN}, note="x")
+    jammed["now"] = True
+    p.revert()
+
+    assert applied.calls == 0, (
+        "it made the untested configuration the live one while telling "
+        "somebody it had put the old one back"
+    )
+
+
+def test_an_undo_the_box_could_not_put_into_effect_says_so_and_still_stands(
+    probation, written, applied
+):
+    # netplan refusing to apply does not un-restore the file, so the undo has
+    # happened either way; the box just needs restarting to pick it up. It
+    # must not come back as a failure, and it must not claim more than it did.
+    applied.fails = True
+    written.store[WIRED] = "the old one\n"
+    probation.begin({WIRED: PLAN}, note="x")
+    undone = probation.revert()
+
+    assert undone["phase"] == "reverted"
+    assert written.store[WIRED] == "the old one\n"
+    assert "off and on" in undone["message"] or "restart" in undone["message"].lower(), \
+        undone["message"]
+
+
+def test_an_undo_the_box_cannot_write_down_is_not_performed_over_and_over(
+    probation, written, monkeypatch, applied
+):
+    """A box that cannot record an undo must not go on performing it.
+
+    Nothing takes an unconfirmed change out of the record except writing the
+    record, so when that write fails the next look at the page finds the same
+    change waiting and undoes it again - every couple of seconds, for as long
+    as anybody has the page open. Rewriting a file twice is wasteful.
+    Reconfiguring every interface twice a second is a box whose network is
+    down more often than it is up, and nobody can reach a box like that to
+    make it stop. So the disruptive half only happens once the box has
+    written down that it happened.
+    """
+    written.store[WIRED] = "the old one\n"
+    probation.begin({WIRED: PLAN}, note="x")
+
+    def the_disk_filled_up(path, text, **kw):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(configwrite, "atomic_write_text", the_disk_filled_up)
+    probation.revert()
+    probation.state()
+    probation.state()
+
+    assert applied.calls == 0, (
+        "every poll of the network page bounces every interface on the box"
+    )
+    assert written.store[WIRED] == "the old one\n", "the file did not go back"
+
+
+def test_nothing_is_applied_when_a_change_never_got_as_far_as_the_files(
+    tmp_path, applied
+):
+    # netplan refused it, so nothing was ever applied and nothing was ever
+    # written. Bouncing every interface on the box to fix nothing at all is
+    # not a free thing to do.
+    store = {WIRED: "the old one\n"}
+    trier = FakeTry()
+    trier.fail_to_start = True
+    p = _probation_with(tmp_path, lambda path, c: store.__setitem__(path, c),
+                        store.get, trier)
+
+    with pytest.raises(NetworkError):
+        p.begin({WIRED: PLAN}, note="x")
+    assert applied.calls == 0
 
 
 # ==========================================================================
@@ -418,6 +845,133 @@ def test_a_trial_recorded_by_another_process_is_not_this_one_s_to_keep(
     with pytest.raises(NetworkError):
         dashboard().confirm()
     assert written.store[WIRED] == "the old one\n"
+
+
+# ==========================================================================
+# netplan reads the newline and then refuses the change anyway
+#
+# This is the failure the whole module exists to handle, and it is the one a
+# stand-in that always exits 0 can never produce. `netplan try` does not just
+# sit there: on ENTER it runs the apply, and an apply can fail on a plan that
+# passed validation - a wifi network that will not associate, a static address
+# already taken, a renderer that will not come back up. The newline arrives,
+# the change is not kept, and the process's exit status is the only thing on
+# the box that knows. Reading it as success means the page says "these are your
+# settings now" to somebody whose box has quietly gone back to the old ones -
+# or, worse, has no network at all and no dashboard left to say so from.
+# ==========================================================================
+def test_a_netplan_that_refuses_the_change_on_enter_is_never_reported_as_kept(
+    netplan_says_no, written, applied
+):
+    written.store[WIRED] = "the old one\n"
+    netplan_says_no().begin({WIRED: PLAN}, note="x")
+
+    with pytest.raises(NetworkError):
+        netplan_says_no().confirm()
+
+    assert netplan_says_no.marker.read_text() == "confirmed", (
+        "the newline never reached netplan, so this proves nothing about what "
+        "the box does when netplan refuses"
+    )
+    assert written.store[WIRED] == "the old one\n", (
+        "netplan would not keep that configuration and the box left it on the "
+        "disk for the next boot to apply for good"
+    )
+    assert netplan_says_no().state()["phase"] == "reverted"
+    assert applied.calls == 1, (
+        "the file went back but the box goes on running the configuration "
+        "netplan itself refused"
+    )
+
+
+def test_a_netplan_try_that_exits_badly_is_a_failure_even_though_enter_was_pressed(
+    tmp_path
+):
+    # The same thing one level down, where the exit status is actually read.
+    # Pressing ENTER is not the success; surviving it is.
+    marker = tmp_path / "pressed-enter"
+    trier = NetplanTry(timeout_command=[
+        sys.executable, "-c", REFUSES_TO_KEEP_IT, str(marker),
+    ])
+    handle = trier.start(120)
+
+    with pytest.raises(NetworkError) as caught:
+        trier.confirm(handle)
+
+    assert marker.read_text() == "confirmed"
+    assert "keep" in str(caught.value).lower(), str(caught.value)
+
+
+# ==========================================================================
+# The trial that ends in the gap before the newline
+#
+# `confirm` looks to see whether the trial is still running and then writes the
+# newline that commits it. Those are two steps, and between them sits `netplan
+# try`'s own countdown, which belongs to netplan and not to this box. Somebody
+# pressing Keep on the last second of the window lands in that gap, and there
+# is no lock this process can take that netplan will respect. So the guard is
+# reachable on a customer's box even though the check just above it said yes,
+# and the only safe answer is the one that admits the change did not happen.
+# ==========================================================================
+class _TheTrialEndsInTheGap(Probation):
+    """netplan's own timeout fires between the check and the newline."""
+
+    def _still_running(self, data):
+        alive = super()._still_running(data)
+        if alive:
+            trial = netprobation._TRIALS[data["handle"]]
+            trial.process.kill()
+            trial.process.wait(timeout=10)
+        return alive
+
+
+def test_a_trial_that_ends_in_the_gap_before_the_newline_is_not_reported_as_kept(
+    tmp_path, written, applied
+):
+    written.store[WIRED] = "the old one\n"
+    request = _requests_like_the_dashboard(
+        tmp_path, written, WAITS_FOR_ENTER, cls=_TheTrialEndsInTheGap,
+    )
+    request().begin({WIRED: PLAN}, note="x")
+
+    with pytest.raises(NetworkError):
+        request().confirm()
+
+    assert not request.marker.exists(), \
+        "there was no terminal left, so nothing can have pressed ENTER on it"
+    assert written.store[WIRED] == "the old one\n", (
+        "it told somebody the change was kept while netplan was putting the "
+        "old settings back underneath them"
+    )
+    assert request().state()["phase"] == "reverted"
+
+
+def test_confirming_a_trial_that_has_already_finished_is_refused_not_passed_over(
+    tmp_path
+):
+    # Silence here would be the module's one unforgivable lie: the caller takes
+    # it for success, the page says the new settings are the box's settings
+    # now, and netplan has already put the old ones back.
+    trier = NetplanTry(timeout_command=[
+        sys.executable, "-c", ALREADY_GONE, str(tmp_path / "unused"),
+    ])
+    handle = trier.start(120)
+    _wait_for(trier, handle, running=False, why="the stand-in never exited")
+
+    with pytest.raises(NetworkError) as caught:
+        trier.confirm(handle)
+    assert "previous" in str(caught.value) or "no longer" in str(caught.value), \
+        str(caught.value)
+
+
+def test_confirming_a_trial_this_process_never_started_is_refused(tmp_path):
+    # What a record left behind by a dashboard that has since restarted looks
+    # like from down here: a handle naming a trial that is not in this
+    # process's table at all.
+    trier = NetplanTry(timeout_command=[sys.executable, "-c", ALREADY_GONE])
+
+    with pytest.raises(NetworkError):
+        trier.confirm("netplan-try-from-a-dashboard-that-has-gone")
 
 
 # ==========================================================================

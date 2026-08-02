@@ -30,6 +30,17 @@ SMB_CONF="/etc/samba/smb.conf"
 WORKGROUP="WORKGROUP"
 SERVER_STRING="JV Projects Retro Box"
 
+# ${SHARE_PATH} is interpolated unescaped into the smb.conf heredoc below. A
+# path containing a newline would inject an arbitrary extra line - a new
+# stanza, say - into the file this box's file sharing runs from. Builder-
+# supplied via --path rather than reachable from the LAN, so this is
+# robustness rather than a live vulnerability, but it costs nothing to check
+# before writing a config file from it.
+if [[ "${SHARE_PATH}" == *$'\n'* ]]; then
+  echo "!! --path must not contain a newline" >&2
+  exit 2
+fi
+
 have_package() {
   apt-cache show "$1" > /dev/null 2>&1
 }

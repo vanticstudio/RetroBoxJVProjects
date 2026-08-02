@@ -16,16 +16,23 @@ first.
 > SSH in and run:
 >
 > ```bash
-> cd ~/RetroBox && ./scripts/install.sh --service
+> cd ~/RetroBox && ./scripts/install-service.sh
 > ```
 >
 > It leaves your settings, channels and videos alone. It replaces the two
 > service files that tell the box how to start itself — the old dashboard one
 > stopped **Restart**, **Reboot**, **Shut down**, the clock and the whole
 > **Network** page from working, and no amount of pressing the buttons fixes
-> that. An update installed from the dashboard can't do it for you, because
-> those files live outside the copy of the project it updates. Once it's done,
-> it's done.
+> that. It also refreshes the short list of commands the box is allowed to run
+> as root, which now includes the one that swaps a network file into place in a
+> single step; until it has been run, saving anything on the **Network** page
+> comes back with an error ending in *"this box may need
+> scripts/install-service.sh run again"*, and the box goes on using the network
+> settings it already has. (On a slightly older version that error reads
+> `sudo: a password is required` and nothing else — same cause, same fix.)
+> An update installed from the dashboard can't do it for you, because those
+> files live outside the copy of the project it updates. Once it's done, it's
+> done.
 
 ### Added
 
@@ -52,6 +59,47 @@ first.
 - **A remote test.** Press a button on your remote and watch it appear, so you
   can tell whether the Flirc took its programming without guessing at the
   television.
+- **The picture sliders now change the television as you move them.** There is
+  no correct amount of curvature, so the only way to set it is to watch the
+  screen while you drag — and until now you had to save, look up, change it and
+  save again to find the one you wanted. Nothing you are watching is disturbed:
+  the programme carries on and simply looks different. What you see while
+  dragging is a **preview** and is never written to the box. **Save picture
+  settings** keeps it, **Put the saved picture back** undoes the lot in one
+  press, and so does closing the browser, the wifi dropping mid-drag, or
+  switching the box off at the wall. If the dashboard goes quiet for twenty
+  seconds the television puts your saved picture back by itself — nobody can
+  leave a half-finished experiment on somebody else's television by wandering
+  off.
+- **A Files tab: the whole library, from your phone.** Browse the folders, tick
+  what you want and delete it — one episode, a whole show, or a mixed handful —
+  and rename a folder without breaking the channel that plays from it. This is
+  the tab that means you never have to plug a keyboard in.
+
+  **Nothing you delete is destroyed.** It moves to a trash folder on the same
+  disk, which means **deleting frees no space at all** until you empty the
+  trash — so the box says so on every screen that mentions deleting, and puts
+  **Empty the trash** right next to the button that doesn't free anything.
+  Anything in the trash for a fortnight is cleared automatically, at start-up
+  as well as on a timer, because this box spends most of its life switched off
+  at the wall.
+
+  Before anything moves you are told **how many files, how much space, and
+  which channels are affected**. Delete a folder a channel plays from and it
+  names the channel and says what the television will show instead — colour
+  bars and `NO SIGNAL` — until you point it somewhere else or restore the
+  folder. Restoring puts things back exactly where they came from, and if
+  something has taken the name since, the box asks rather than choosing for
+  you; say replace and the file that was there goes to the trash rather than
+  away.
+
+  Renaming a folder repoints the channel — and any scheduled block with its own
+  folder — in the same step. Both, or neither. And the box's own folders are
+  listed but can't be selected, so you can see where your space went without
+  being able to delete the machinery by accident.
+- **The System page now shows what the trash is holding.** It counts as used
+  space on the library disk, and nothing else on the box would have explained
+  it.
 - **Restart and shutdown from the dashboard**, and a factory reset that clears
   settings and channels **without touching your video files**.
 - **Timezone and clock.** It now warns you when nothing is keeping the clock
@@ -63,6 +111,24 @@ first.
   about once a day and tells you what changed. Installing is always your
   decision — it never updates itself. If an update doesn't come up cleanly, the
   box puts the previous version back on its own.
+- **The box now notices when it has lost permission to look after itself, and
+  says so in words you can act on.** Restarting, rebooting, shutting down,
+  setting the clock and everything on the **Network** panel need permission
+  that is granted once, when the box is set up. A box set up by an earlier
+  version was granted a shorter list, and nothing ever refreshed it: one box
+  reached its owner playing video perfectly with **Shut down** working and
+  **Restart**, **Reboot** and the whole **Network** page failing, weeks later,
+  with an error about a password on a box that has no password. The box now
+  checks — every time it starts, and again whenever you open **System** — and
+  puts a message at the top of that page naming the buttons that have stopped
+  working, what has not happened to your videos or your channels, and the one
+  command to run on the box, with your own folder and account already in it.
+  There is a **TRY THE REPAIR FROM HERE** button, and it is honest: on a normal
+  box it changes nothing and tells you why, because a page with no password on
+  it that could grant itself root would be a box anyone on your home network
+  could take over. The message tells three different faults apart, including
+  one that re-running the installer would not fix, and does not offer the
+  command for that one.
 
 ### Changed
 
@@ -78,6 +144,81 @@ first.
 
 ### Fixed
 
+- **The dashboard no longer answers a button press with a sentence about
+  `sudo`.** When a button the box is not allowed to press came back, what you
+  were shown was the machine's own words for it — *"sudo: a password is
+  required"* — on a box that has no password to type and no keyboard to type
+  it on. Every one of those now comes back in English, saying what has stopped
+  working, what has not been affected, and the one command that puts it right.
+  That covers the Power buttons, the clock, the **Network** page, changing the
+  box's name and an update that could not restart the television.
+- **...and the Log panel and Copy for support no longer smuggle those words
+  back in.** The last few hundred journal lines are what the log panel
+  shows and what **Copy for support** puts on your clipboard, and `sudo`'s own
+  sentences were sitting in them — so the exact wording the change above exists
+  to keep off your screen arrived on it anyway, in the panel directly above the
+  notice explaining it. Anything `sudo` wrote about itself is now taken out of
+  both. What the box itself wrote around those words stays, and so do the file
+  names: those are what tell us which permission is missing when you send the
+  bundle in. The unedited line is still in the box's own journal.
+- **The dashboard no longer says the television isn't running while it plainly
+  is.** The television and the dashboard leave each other two small files in a
+  folder the system is supposed to create for the account the box runs as. On
+  a box set up by hand that folder is never created, so the files had nowhere
+  to go: the dashboard opened perfectly, showed an empty status panel, and
+  every button did nothing at all. The two of them now agree on somewhere they
+  can both write — whichever one starts first decides for both — so it no
+  longer matters whether that folder is there, or turns up later.
+- **...and the installer now creates that folder properly, and proves the box
+  works before it says so.** Setting the box up by hand never told the system
+  to make that folder for an account nobody logs into, and the fault was
+  invisible at the time because whoever installs it *is* logged in — so
+  everything worked while they watched and stopped the moment they closed the
+  window. The installer now does it, checks it, and then waits for the
+  television to actually write its status and open the socket the dashboard
+  talks to. If either doesn't happen, the install stops and names what is
+  missing instead of printing "Done!" over a box whose dashboard can't reach
+  its own television. It also refuses to finish over a config the television
+  would not start with, checks that both services really stayed up rather than
+  merely started, and puts the television ahead of the login prompt so a boot
+  no longer flashes "retrobox login:" on the screen first.
+- **A box set up by hand no longer waits for a network it hasn't got.** Carried
+  to a friend's house and switched on with no cable in it, it could sit showing
+  a red *"A start job is running for Wait for Network to be Configured"*
+  counting to two minutes on the television before any picture appeared, on
+  every cold start. The unattended installer has always prevented that; the
+  documented one now does too, and checks it rather than assuming it.
+- **A box set up by hand now has the library folder the instructions describe,
+  and a starter setup that matches them.** "Anything dropped in becomes a
+  channel" was simply not true on that path: the folder was only created as a
+  side effect of setting up the file share (so `--no-share` produced a box with
+  no library at all), and the starter settings pointed at five folders that did
+  not exist, with the "watch this folder" feature switched off. Dragging a
+  folder of shows in did nothing, silently, and the dashboard's upload page
+  refused to accept anything.
+- **An update can no longer leave the box running something it isn't allowed
+  to run.** The box may only use a short, named list of commands as root, and
+  that list is written down once, when the box is first set up. Nothing ever
+  refreshed it — so the first version to add something new to it would have
+  installed perfectly, played video perfectly, and left the new button dead, on
+  every box in the world on the same day, with nothing in the dashboard to say
+  why. An update now asks the box, after the new version is unpacked and before
+  the television is restarted into it, whether it is still allowed to do
+  everything that version needs. If it isn't, the update is undone, the version
+  you had comes back, and **System → Software** shows you the one command to run
+  on the box — after which the update installs normally. (That command has to be
+  typed on the box itself. The dashboard has no password on it, so it is not
+  allowed to hand itself new permissions; if it were, so could anyone else on
+  your home network.)
+- **A failed rollback no longer tells you the box is working normally.** When
+  an update didn't work and the box put the previous version back, it said "It
+  is working normally and nothing was lost" whether or not any of that had
+  actually worked — a sentence people read off a television and use to decide
+  the box can be left until the morning. It now checks each step, names the one
+  that didn't finish, and tells you to switch the box off at the wall and on
+  again, which really does take the job up again: an unfinished rollback is now
+  finished at the next start-up instead of sitting there. The reassuring wording
+  is still there for when it is true.
 - **A version that stops working overnight now puts itself back.** The box
   promised to undo an update that didn't come up, and it only ever checked once
   — while the box was still switched on and the picture was already back. If a
@@ -186,6 +327,48 @@ first.
   somebody renamed a channel on a phone could throw the restored file away a
   heartbeat after it landed, with both people told it had saved. Replacing the
   whole file now waits its turn like every other change.
+- **A network change you kept can no longer be taken away at the next start-up.**
+  The box wrote down that you'd kept a change *after* it had already made it
+  permanent. If it couldn't finish writing that down — a full disk, a read-only
+  filesystem — the note left behind still said the change was on trial, and the
+  next start-up dutifully put the old settings back over the ones you'd chosen,
+  with nobody watching. It now writes down that it is keeping the change before
+  the change is made, and if it can't write that down it doesn't make the change
+  at all: you get the previous settings back and a message saying so, which is
+  the one direction you can always try again from.
+- **A box switched off in the second between pressing *Keep* and it taking
+  effect no longer has to guess what you wanted.** It used to simply stand by
+  the change. It now reads its own network files at the next start-up and goes
+  with whatever is actually in them: if they hold your new settings the change
+  stands as kept and the box starts using them there and then; if they hold the
+  old ones — which is what a box that had already begun undoing the change looks
+  like — it goes back to those and says so. If it cannot read them at all it
+  goes back to the previous settings, because a box that cannot tell does not
+  get to announce that your change was saved. In every case the **Network** page
+  says which of the two happened rather than leaving you to work it out.
+- **The one message the Network page could not draw now appears.** If the box
+  keeps a change but cannot start using it straight away, the page now says so
+  in plain words — *"Kept, but this box could not start using those settings
+  straight away. Switch it off and on again if it is not on them yet"* — instead
+  of showing nothing at all. Switching it off and on again is the whole of the
+  fix, so something had to say it.
+- **Settings put back at start-up are now actually used, not just filed.** A box
+  that came up on a network setting nobody confirmed rewrote the good settings
+  to disk and stopped there — so it went on running the bad ones for the whole
+  session, and if those were why you couldn't reach it, there was no page to
+  open to try again. It now puts them into effect as it starts, so the box is
+  back on the network during that start-up instead of the one after it. If
+  netplan won't take them, it says so and the settings still take effect at the
+  next restart.
+- **Switching the box off at the wall while it saves a network setting can no
+  longer leave it with no network at all.** The network file was written
+  straight over the live one, which empties it first — and a power cut in that
+  moment left half a file in `/etc/netplan`, which stops the box configuring
+  *any* adapter, not just the one being changed. That is a box that comes up
+  with no network and no dashboard. The new setting is now built in a file
+  beside the real one and swapped in as a single step, so the power can go at
+  any point and the box comes up on either the old settings or the new ones,
+  never on neither.
 
 ### Security
 
@@ -203,10 +386,13 @@ first.
   already on the box that asks for something else is ignored rather than
   obeyed, so the box still starts and the power button still works — it just
   behaves like the standard one.
-- **Replacing your whole config now asks first**, the same way the backup
-  restore and the factory reset already did. Uploading a config throws away
-  every setting on the box in one go, and that shouldn't have been a single
-  unconfirmed request.
+- **Replacing your whole config now has to be asked for deliberately**, the same
+  way the backup restore and the factory reset already did. Uploading a config
+  throws away every setting on the box in one go, and that shouldn't have been
+  something a single unmarked request from anywhere on the network could do. On
+  the dashboard nothing changes: choosing the file on **System → Config file**
+  is what confirms it, so pick carefully — that one does not ask twice the way
+  the buttons next to it do.
 - **Your wifi password is no longer handed out over the network.** While a
   network change was on trial, the box kept a note of the settings it would put
   back if you didn't confirm — which, on a wifi box, includes the password. That
@@ -215,6 +401,53 @@ first.
   out of every answer now, the note itself can only be read by the box, and it's
   deleted the moment the change is kept or undone. If you'd rather not take the
   word of a changelog, change your wifi password once after updating.
+- **A settings file can no longer point the box at somewhere it has no business
+  being.** `config.yaml` says where your library is, where the station idents
+  are, and where each channel's folder is — and the dashboard, which has no
+  password, will accept a whole new one from anybody on your wifi. Those folders
+  were taken exactly as written, so a file uploaded from another device could
+  aim the box's own upload page at the operating system's directories, or at the
+  folder Retro Box itself is installed in, and start writing into it. The box now
+  refuses any folder that is part of the system (`/etc`, `/usr`, `/boot` and the
+  rest), the software's own folder, your hidden dotfile folders such as `~/.ssh`,
+  or your home directory itself. A shortcut left in your media folder is judged
+  by where it actually leads, so one dropped over the file share can't quietly
+  become a channel pointing somewhere else — including when the box is the one
+  turning that folder into a channel for you. Ordinary places are all still
+  fine: an external drive, a network share, `~/Videos`.
+- **"What counts as a video" is now a fixed list.** The upload page uses that
+  setting to decide what it is allowed to write to the disk, so a config that
+  added `.py` or `.service` to it turned the page into a way of putting one of
+  those on the box. Only real video formats are accepted now — about thirty-five
+  of them, generously chosen — and a list with anything else in it is ignored
+  in full rather than half-obeyed. Four smaller settings are checked the same
+  way: the start-up clip has to name a video, the on-screen font has to be a
+  plain font name, the HDMI-CEC helper has to be the standard one, and the audio
+  device name has to look like an audio device name.
+- **A setting that doesn't pass is ignored, never fatal, and never silent.**
+  Whichever of the above is refused, the box drops just that one setting, writes
+  the reason in its log, and carries on — a refused channel leaves the rest of
+  the lineup playing, because a television that won't start is far worse than
+  one channel missing. The dashboard refuses to *save* a config with a refused
+  setting in it and tells you exactly what it refused, so nobody ends up
+  quietly running a setting they never chose.
+- **The name of a folder can no longer rewrite your settings file.** With
+  "turn new folders into channels" switched on, the box writes what it finds
+  back into `config.yaml` — and anyone on your home network can create a folder
+  in your library, over the file share or from the upload page, neither of which
+  asks for a password. The folder's name and location were being typed straight
+  into the settings file, where several ordinary characters mean something: a
+  `#` in a name cut the rest of the line off, a `:` could make the file
+  unreadable, and a name containing a line break could add a *whole new setting*
+  of its own — including the one that says what the box runs when you switch it
+  off, which is exactly the thing that was locked down above. In the worst case
+  a folder dropped on the box could put a command of its choosing behind your
+  power button, or delete every channel you had set up, with nothing on screen
+  to show for it. Names and folders are now written by the same machinery that
+  writes the rest of the file, so `Films #2` and `News: at ten` come back as
+  themselves; and the box re-reads the finished file before saving it, refusing
+  to save anything that doesn't still say what it said plus the new channels.
+  Your comments and layout in `config.yaml` are untouched, as before.
 
 ## [1.0.3] - 2026-07-31
 

@@ -114,6 +114,13 @@ def create_backends(options: Optional[Dict] = None) -> List[InputBackend]:
 
     Backends that are requested but unavailable on this machine are quietly
     skipped, so the same config works on the box and on a dev laptop.
+
+    ``cec_binary`` becomes argv[0] of a real ``subprocess.Popen`` and
+    ``cec_osd_name`` becomes an element of the same command line, so both are
+    checked by ``config.parse_input_options`` before they ever get here - the
+    same treatment ``power_off_command`` gets, and for the same reason. This
+    function trusts what it is handed; the loader is where that trust is
+    earned.
     """
     options = dict(options or {})
     backends: List[InputBackend] = []

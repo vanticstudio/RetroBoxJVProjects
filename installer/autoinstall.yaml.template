@@ -59,24 +59,35 @@ autoinstall:
   # `|| echo` so it is harmless, but the rename only actually lands because
   # subiquity did it here first.
   #
-  # The password is a crypt(3) SHA-512 hash. It MUST be single-quoted: it is
-  # full of '$' and YAML will otherwise mangle it.
+  # The password is a crypt(3) SHA-512 hash, full of '$'. installer/lib/
+  # render_autoinstall.py runs it through the same yaml_str() helper the wifi
+  # SSID and password use below, which hands back a JSON (= valid YAML
+  # double-quoted) scalar with correct escaping built in - so the placeholder
+  # below carries its OWN quotes and must not be hand-quoted here. (A hash
+  # happens to have no character that would break a hand-typed single quote;
+  # an SSH key's comment field routinely does - see authorized-keys below.)
   # It is for LOCAL CONSOLE ACCESS ONLY - see `ssh:` below and installer/README.md.
   identity:
     realname: Retro Box
     hostname: __HOSTNAME__
     username: __USERNAME__
-    password: '__PASSWORD_HASH__'
+    password: __PASSWORD_HASH__
 
   # --- Remote access is key-only -------------------------------------------
   # allow-pw: false is the single line that makes a shared, publicly-known
   # console password safe. Someone standing at the box can log in. Someone on
   # the network cannot, whatever they know.
+  #
+  # The key, like the password hash above, is substituted already-quoted by
+  # yaml_str() - NOT hand-quoted here. An SSH public key's comment field
+  # routinely contains an apostrophe (e.g. "... jake's laptop"), and a
+  # hand-typed single quote around that produces an answer file that is not
+  # YAML. The unattended install then fails somewhere no one will ever see it.
   ssh:
     install-server: true
     allow-pw: false
     authorized-keys:
-      - '__SSH_AUTHORIZED_KEY__'
+      - __SSH_AUTHORIZED_KEY__
 
   # --- Disk -----------------------------------------------------------------
   # Guided, whole-disk, no questions, unknown disk of unknown size.
@@ -85,9 +96,28 @@ autoinstall:
   # else the largest disk of any kind. Both carry `size`, so both inherit the
   # in-use-partition filter that excludes the stick we booted from.
   #
-  # sizing-policy: all hands the whole volume group to root. Without it a 1 TB
-  # appliance disk gets a 100 GiB root and leaves the rest idle - wrong on a
-  # box whose only job is storing video.
+  # NOTHING HERE MAY NAME A SIZE. The target is a secondhand machine whose disk
+  # is unknown until it is in your hands, so `largest` and `all` are the only
+  # two quantities allowed in this section. Anything numeric turns "boots on
+  # whatever we bought this week" into "boots on the one box it was written for".
+  #
+  # sizing-policy: all is the fix for a real, shipped fault. subiquity's default
+  # is `scaled`, and scaled gives the root LV only PART of the volume group:
+  # roughly half on a disk between 20 GB and 200 GB, and a flat 100 GiB above
+  # that. The rest is left unallocated inside the VG, where nothing reports it
+  # and nothing uses it. Measured on hardware: a 128 GB box came up claiming
+  # 57 GB usable with 58 GB sitting idle. On a media appliance the size of the
+  # disk is the one number the customer actually checks, so a 512 GB box that
+  # says 240 GB reads as a lie, and the dashboard's System page repeats the
+  # smaller figure without a murmur.
+  #
+  # `all` is the declarative fix and it is the primary one - it costs nothing,
+  # it asks no questions, and it works on a disk of any size. It is not the only
+  # one. installer/storage-grow.sh re-checks the finished box at the end of the
+  # install, claims anything still unallocated, and shouts into
+  # /var/log/retrobox-install.log if the root filesystem still does not account
+  # for the disk. Two independent mechanisms, because this failure is silent and
+  # the box is sold.
   storage:
     layout:
       name: lvm
@@ -101,10 +131,27 @@ autoinstall:
   # Wired and wireless both configured. Wired wins when present (lower route
   # metric); wireless is the automatic fallback.
   #
-  # `optional: true` on every interface is the important part. It is what stops
-  # systemd-networkd-wait-online holding the boot up for its full timeout on a
-  # box with nothing plugged in. This box must boot and play with no network
-  # at all, so nothing here may ever block.
+  # `optional: true` on every interface, including the ones in the wifi block
+  # that render_autoinstall.py substitutes in below. (Do not write that
+  # placeholder's name in a comment: the renderer replaces every occurrence of
+  # it, so a second one lands a netplan block in the middle of a sentence and
+  # the answer file stops being YAML. tests/test_installer_boot.py parses both
+  # renders for exactly this reason.)
+  #
+  # netplan's default is `optional: false`, which it
+  # renders as RequiredForOnline=yes, and one interface like that is all
+  # systemd-networkd-wait-online needs to hold the boot up for its full timeout
+  # on a box with nothing plugged in. This box must boot and play with no
+  # network at all, so nothing here may ever block.
+  #
+  # It is NOT the whole fix, and this section must not be trusted as if it
+  # were. `optional` only governs interfaces described HERE. The units that
+  # actually drag network-online.target into the boot transaction are smbd and
+  # wsdd, which scripts/setup_lan_share.sh installs and enables, and the
+  # dashboard's Network page writes netplan files of its own at runtime that
+  # this file has no say over. installer/harden-boot.sh masks the wait-online
+  # units outright, which is the fix that does not depend on who wrote which
+  # netplan file. Read the header of that script before touching either.
   network:
     version: 2
     ethernets:
@@ -152,8 +199,14 @@ __WIFI_BLOCK__
     - curtin in-target -- git clone https://github.com/vanticstudio/RetroBoxJVProjects.git /opt/retrobox
 
     # 2. Pin a release, so a new box starts on a known tag and the update system
-    #    has a coherent starting point. The repo has no vX.Y.Z tags yet; until
-    #    it does, this stays on main and says so loudly rather than failing.
+    #    has a coherent starting point.
+    #
+    #    THIS ABORTS THE INSTALL IF THE REPO HAS NO vX.Y.Z TAG. That is the
+    #    point: without one, every stick baked that day would produce a box
+    #    running unreviewed HEAD, and these boxes are sold and then unreachable.
+    #    The failure explains how to cut a release. Building a bench box on
+    #    main is still possible - add --allow-unpinned - and it says loudly in
+    #    the log that the result is not sellable.
     - curtin in-target -- /opt/retrobox/installer/pin-release.sh
 
     # 3. Everything else.

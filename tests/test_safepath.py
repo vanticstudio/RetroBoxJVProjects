@@ -94,6 +94,37 @@ def test_the_folder_itself_is_not_a_valid_destination(tmp_path):
         resolve_inside(folder, folder)
 
 
+@pytest.mark.parametrize("spelling", [".", "S01/..", "./.", "S01/S02/../.."])
+def test_the_folder_itself_is_refused_as_itself_and_not_as_an_escape(tmp_path, spelling):
+    """Naming the folder is its own refusal, with its own answer.
+
+    Every one of these resolves back to the folder, and the containment check
+    on its own already rejects them - a folder is never inside itself - so
+    dropping the check above it would still raise. What it would lose is the
+    sentence. "/media/sitcoms is outside /media/sitcoms" is what a customer
+    would be shown for dropping a folder rather than a file into the uploader,
+    and there is nothing in that sentence anybody can act on. Worse, it reads
+    like a containment bug, which is the one refusal on this box that must
+    never be dismissed as a glitch: it is the same message a real escape
+    attempt produces, and someone who has learnt to ignore it will ignore that
+    one too. The two are different refusals and they say different things.
+    """
+    folder = tmp_path / "sitcoms"
+    folder.mkdir()
+
+    with pytest.raises(UnsafePath) as caught:
+        resolve_inside(folder, folder / spelling)
+
+    said = str(caught.value)
+    assert "folder itself" in said, (
+        f"a folder named as its own destination was refused with {said!r}, "
+        f"which describes a different problem"
+    )
+    assert "outside" not in said, (
+        f"refused by the containment check rather than as what it is: {said!r}"
+    )
+
+
 def test_a_path_that_climbs_out_is_refused(tmp_path):
     folder = tmp_path / "sitcoms"
     folder.mkdir()

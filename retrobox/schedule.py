@@ -38,6 +38,7 @@ from .daypart import (
     Daypart,
     DaypartError,
     active_daypart,
+    clock_report,
     format_clock,
     parse_clock,
 )
@@ -246,7 +247,12 @@ def _epoch_for(minute: int) -> float:
 def preview_at(parts: Sequence[Daypart], minute: int) -> Dict[str, Any]:
     """What this channel would be at ``minute``, straight from the engine."""
     minute = int(minute) % MINUTES_PER_DAY
-    part = active_daypart(list(parts), _epoch_for(minute))
+    # ``clock_trust=True`` because this is a hypothetical, not a reading. The
+    # engine pauses dayparting when it cannot vouch for the box's clock, which
+    # is right for the television and wrong here: the editor is asking "what
+    # would be on at 3am", and a box with a broken clock is exactly the box
+    # whose owner needs that screen to keep working.
+    part = active_daypart(list(parts), _epoch_for(minute), clock_trust=True)
     if part is None:
         return {
             "active": False, "at": format_clock(minute), "name": None,
@@ -277,10 +283,27 @@ def now_minute() -> int:
     return local.tm_hour * 60 + local.tm_min
 
 
+def clock_note(epoch: Optional[float] = None) -> Dict[str, Any]:
+    """Whether the schedule above this is actually being applied to the box.
+
+    The timeline can be perfect and the television can be ignoring all of it,
+    because the engine pauses dayparting when the clock cannot be believed. A
+    schedule editor that cannot say so is the silent failure all over again -
+    somebody would drag blocks around for an hour wondering why nothing
+    changed at 10pm.
+
+    Thin on purpose: :func:`retrobox.daypart.clock_report` is the real answer,
+    and this exists so the editor does not have to reach past the module it is
+    already talking to.
+    """
+    return clock_report(epoch)
+
+
 __all__ = [
     "MAX_BLOCKS",
     "ScheduleError",
     "blocks_from_config",
+    "clock_note",
     "day_view",
     "now_minute",
     "preview_at",

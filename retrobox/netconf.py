@@ -23,6 +23,13 @@ password only ever exist inside a document handed to a fixed command on stdin.
 There is no shell anywhere in this module and no argv position that a field
 can reach.
 
+**A netplan file is never half-written.** ``tee`` truncates before it writes,
+and this box is switched off at the wall, so a document is built in a staging
+file beside its target and renamed over it in one step. A truncated file in
+``/etc/netplan`` is not a broken interface, it is ``netplan generate`` failing
+for the whole directory - a box with no network on anything, which nobody can
+reach to fix.
+
 Files are written alongside whatever the installer and the distro already put
 in ``/etc/netplan``, never replacing them, and numbered so they merge last.
 Wired and wireless are separate files so that changing one cannot disturb the
@@ -59,6 +66,28 @@ PLAN_MODE = 0o600
 #: holding one is a box running on whatever the distro's own files say.
 EMPTY_DOCUMENT = "network: {}\n"
 
+#: What a new document is called while it is being written, before it becomes
+#: the file netplan reads.
+#:
+#: Two things about this name are load-bearing. It is in the same directory as
+#: its target, because a rename is only atomic within one filesystem - across
+#: two it is a copy, which is the very thing being avoided. And it does not
+#: end in ``.yaml``, because netplan reads ``/etc/netplan/*.yaml`` and a
+#: half-written document it can see is no better than a half-written one it
+#: was given.
+STAGING_SUFFIX = ".retrobox-new"
+
+
+def staging_for(path: str) -> str:
+    """Where a new version of one of our netplan files is built.
+
+    A constant derived from a constant, so the sudoers rule can name it in
+    full - see :func:`retrobox.servicectl.sudoers_rule`, which builds its
+    entry from this same function.
+    """
+    return path + STAGING_SUFFIX
+
+
 #: Interface names as the kernel makes them. Not a sanitiser - a whitelist.
 _INTERFACE = re.compile(r"\A[A-Za-z][A-Za-z0-9]{0,14}\Z")
 
@@ -68,6 +97,15 @@ MIN_PASSWORD = 8
 MAX_PASSWORD = 63
 
 COMMAND_TIMEOUT = 20.0
+
+#: ``netplan apply`` re-runs generate and then reconfigures every interface,
+#: so it takes seconds rather than milliseconds. It is bounded because the
+#: start-up recovery path waits for it before the dashboard serves its first
+#: page, and the dashboard is the only thing somebody with a sick box can
+#: still reach. The file on the disk is already right by the time this runs,
+#: so the worst a timeout costs is that the box has to be restarted to pick
+#: the configuration up - which is a great deal better than never coming up.
+APPLY_TIMEOUT = 30.0
 
 
 class NetworkError(Exception):
@@ -105,18 +143,42 @@ def _run(cmd: Sequence[str], *, timeout: float = COMMAND_TIMEOUT,
     return result.returncode, result.stdout or "", result.stderr or ""
 
 
+#: Long enough to say what went wrong, short enough that a command which
+#: printed a novel cannot fill the browser or the journal with it.
+MAX_REASON = 300
+
+
 def _reason(*streams: str) -> str:
     """The first thing a failed command said that is worth showing a person.
 
     Callers pass the streams they are willing to repeat, most useful first.
     A stream carrying a wifi password - ``tee`` echoes its own input - is
     simply not passed.
+
+    Capped here rather than at the end, so that anything a caller adds after
+    this - the sentence below, say - cannot be the part that gets cut off.
     """
     for text in streams:
         said = (text or "").strip()
         if said:
-            return said
+            return said[:MAX_REASON]
     return ""
+
+
+#: Added to every step of a write that a stale ``sudoers`` rule refuses.
+#:
+#: A box installed before the staging file existed has a rule naming the live
+#: netplan file and nothing else, so sudo refuses every command that mentions
+#: ``<file>.retrobox-new`` - starting with the very first one, long before the
+#: rename. And what sudo says about a command it has no rule for is "sudo: a
+#: password is required", which sends the owner of a box that has no password
+#: to type off looking for one. This sentence is the only place the thing that
+#: actually fixes it is ever said, so it goes on every step a stale rule can
+#: refuse rather than only on the last of them.
+NEEDS_THE_INSTALLER_AGAIN = (
+    " - this box may need scripts/install-service.sh run again so that sudo "
+    "allows a network file to be written and replaced"
+)
 
 
 # ==========================================================================
@@ -284,56 +346,91 @@ def wifi_plan(
 # Writing it, without any of it becoming an argument
 # ==========================================================================
 def _install_privileged(path: str, content: str, mode: int) -> Tuple[int, str]:
-    """Put ``content`` at ``path`` as root, readable by nobody else, ever.
+    """Put ``content`` at ``path`` as root, readable by nobody else, ever, and
+    without ``path`` ever being a half-written file.
 
     The content goes on **stdin**. The command line is fixed and contains only
     constants from this module - no SSID, no password, no address, ever. There
     is no shell: ``subprocess`` is given a list, so metacharacters are just
     characters.
 
-    The order below is the whole point. ``tee`` creates a file under root's
-    umask, which is 0644, so writing first and narrowing afterwards leaves the
-    customer's wifi password readable by every account on the box for as long
-    as the second command takes - and *permanently* if that second command
-    ever fails. So the file is made root-only **before** any secret goes into
-    it, and if it cannot be made root-only, nothing is written at all.
+    Nothing is ever written into the live file. ``tee`` truncates before it
+    writes, and this box is switched off at the wall - so a cut inside that
+    window would leave a truncated document in /etc/netplan, and netplan
+    generate then fails for the *whole directory*: no network on any
+    interface, on hardware nobody can log in to. So the document is built in a
+    staging file beside it and renamed over it, which is one atomic step. The
+    live file goes from being one complete document to being the other, and a
+    power cut anywhere in here leaves the box exactly as it was. This is the
+    same dance every other write in this codebase does - see
+    :mod:`retrobox.configwrite`.
+
+    The order of the first three steps is the other half of the point.
+    ``tee`` creates a file under root's umask, which is 0644, so writing first
+    and narrowing afterwards leaves the customer's wifi password readable by
+    every account on the box for as long as the second command takes - and
+    *permanently* if that second command ever fails. So the staging file is
+    made root-only **before** any secret goes into it, and if it cannot be
+    made root-only, nothing is written at all. The rename then carries that
+    0600 across with it, because a rename moves the inode: the live file is
+    private from the instant it exists, with no window at all.
 
     That works because of one POSIX guarantee: opening a file that already
     exists ignores the mode argument. ``tee`` truncates and rewrites, but it
     cannot widen a file that is already 0600.
     """
-    narrow = ["sudo", "-n", "chmod", oct(mode)[2:], path]
-    write = ["sudo", "-n", "tee", path]
+    staged = staging_for(path)
+    narrow = ["sudo", "-n", "chmod", oct(mode)[2:], staged]
+    write = ["sudo", "-n", "tee", staged]
+    # -f so it cannot stop to ask about the file it is replacing. Both ends
+    # are constants from this module; sudo is given the same two, spelled the
+    # same way, by the rule servicectl generates.
+    rename = ["sudo", "-n", "mv", "-f", staged, path]
 
     code, _printed, warned = _run(narrow)
     if code != 0:
-        # chmod would not do it. Either there is no file there yet, or we are
-        # not allowed to narrow the one that is - and those need opposite
-        # answers. `cat`, which this box has a sudoers rule for on exactly
-        # these two files, tells them apart.
-        present, _out, _err = _run(["sudo", "-n", "cat", path])
-        if present == 0:
-            # It is there and it cannot be narrowed. Refuse, and leave the
-            # configuration that is on the box alone: an emptied netplan file
-            # is a box that comes up on nothing next time it is switched on.
-            return 1, _reason(warned, "could not make the file private")
-        # Nothing there yet. Bring it into existence holding a document with
-        # no secret in it, and narrow that before the real content goes near
-        # the disk.
+        # There is usually no staging file: it exists only for the moment a
+        # write takes. Bring it into existence holding a document with no
+        # secret in it, and narrow that before the real content goes near the
+        # disk. Nothing here can destroy anything - the staging file is ours,
+        # and the live configuration has not been touched yet.
         code, _printed, warned = _run(write, stdin=EMPTY_DOCUMENT)
         if code != 0:
-            return code, _reason(warned, "the command failed")
+            # This is where an upgraded box that never re-ran the installer
+            # actually stops. Its sudoers rule does not name the staging file,
+            # so the chmod above was refused and so is this - the write never
+            # gets near the rename, which is why the sentence about what to do
+            # has to be here as well as there.
+            return code, (
+                _reason(warned, "the command failed") + NEEDS_THE_INSTALLER_AGAIN
+            )
         code, _printed, warned = _run(narrow)
         if code != 0:
-            # An empty netplan document is left behind. It is not a secret and
-            # it contributes nothing to the merge.
-            return code, _reason(warned, "could not make the file private")
+            # An empty document is left in the staging file. It is not a
+            # secret, and netplan does not read it.
+            return code, (
+                _reason(warned, "could not make the file private")
+                + NEEDS_THE_INSTALLER_AGAIN
+            )
 
-    # The file exists and is root-only, so this cannot expose anything.
+    # The staging file exists and is root-only, so this cannot expose anything.
     code, _printed, warned = _run(write, stdin=content)
     # _printed is tee's copy of its own input - the password. It never becomes
     # part of a message that goes to the browser or the journal.
-    return code, _reason(warned, "the command failed")
+    if code != 0:
+        return code, _reason(warned, "the command failed")
+
+    code, _printed, warned = _run(rename)
+    if code != 0:
+        # The live file has not been touched, so the box keeps the network it
+        # already had. A stale sudoers rule would have stopped this write long
+        # before here, so on this step the likeliest causes are a full disk or
+        # a read-only root - but the sentence costs nothing and a rule missing
+        # only the rename is still a rule the installer would put right.
+        return code, (
+            _reason(warned, "the command failed") + NEEDS_THE_INSTALLER_AGAIN
+        )
+    return 0, ""
 
 
 def write_plan(path: str, content: str) -> None:
@@ -343,7 +440,35 @@ def write_plan(path: str, content: str) -> None:
         raise NetworkError("that is not a file this box writes")
     code, reason = _install_privileged(path, content, PLAN_MODE)
     if code != 0:
-        raise NetworkError(f"could not write the network configuration: {reason[:300]}")
+        # Not truncated here: what a command said is already capped at
+        # MAX_REASON, and the sentence telling somebody what to do about it is
+        # on the end. Cutting the whole thing to a length would cut that off.
+        raise NetworkError(f"could not write the network configuration: {reason}")
+
+
+def apply_plan() -> None:
+    """Make what is in /etc/netplan the configuration the box is running.
+
+    Writing the file is not the same as changing the network. netplan reads
+    /etc/netplan at boot and when it is told to, and at no other time - so a
+    box that has had its old, working configuration put back for it goes on
+    running the one nobody wanted for the rest of the session. If that
+    configuration is why the box cannot be reached, nobody can open the
+    dashboard to ask again, and the whole undo achieved nothing but a tidy
+    file on a machine still sitting silently on somebody's shelf.
+
+    This is disruptive by nature - it reconfigures every interface, so a
+    working connection goes down and comes back - which is why it belongs only
+    at the moment a configuration has actually changed underneath the running
+    system, and never as a routine check.
+    """
+    code, _printed, warned = _run(["sudo", "-n", "netplan", "apply"],
+                                  timeout=APPLY_TIMEOUT)
+    if code != 0:
+        raise NetworkError(
+            f"could not put the network configuration into effect: "
+            f"{_reason(warned, 'the command failed')}"
+        )
 
 
 def read_plan(path: str) -> Optional[str]:
@@ -542,18 +667,24 @@ def connectivity() -> Dict[str, Any]:
 
 
 __all__ = [
+    "APPLY_TIMEOUT",
     "CREDENTIAL_MODE",
+    "MAX_REASON",
     "MAX_SSID",
+    "NEEDS_THE_INSTALLER_AGAIN",
     "NetworkError",
     "PLAN_MODE",
+    "STAGING_SUFFIX",
     "WIFI_FILE",
     "WIRED_FILE",
+    "apply_plan",
     "connectivity",
     "dhcp_plan",
     "interfaces",
     "nameservers",
     "read_plan",
     "scan",
+    "staging_for",
     "static_plan",
     "wifi_plan",
     "wireless_interfaces",

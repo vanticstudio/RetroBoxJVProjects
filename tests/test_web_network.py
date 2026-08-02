@@ -466,6 +466,77 @@ def test_the_panel_is_redrawn_even_when_keeping_the_change_failed(box):
     )
 
 
+def test_a_box_whose_sudo_rules_are_out_of_date_says_so_in_the_browser(
+    tmp_path, runtime, monkeypatch
+):
+    """The whole chain, to the sentence the customer actually reads.
+
+    A box installed before the netplan staging file existed has sudo rules
+    naming the live file and nothing else, so the very first privileged step
+    of a save is refused - and sudo's own words for a command it has no rule
+    for are "a password is required", on a box that has no password to type.
+    Re-running the installer is the entire fix, so it has to be in what comes
+    back, not in a message on a later step this never reaches.
+    """
+    root = tmp_path / "media"
+    root.mkdir()
+    make_show(root, "sitcoms", 1)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        f"media_root: {root}\nchannels:\n"
+        f'  - number: 2\n    name: "S"\n    path: {root / "sitcoms"}\n'
+    )
+
+    def old_sudoers(cmd, **kwargs):
+        cmd = [str(c) for c in cmd]
+        if "addr" in cmd:
+            return 0, IP_JSON, ""
+        if any(part.endswith(netconf.STAGING_SUFFIX) for part in cmd):
+            return 1, "", "sudo: a password is required\n"
+        return 0, "", ""
+
+    monkeypatch.setattr(netconf, "_run", old_sudoers)
+    trier = FakeTry()
+    monkeypatch.setattr(netprobation, "NetplanTry", lambda *a, **k: trier)
+    app = create_app(str(cfg))
+    app.config.update(TESTING=True)
+
+    res = app.test_client().post(
+        "/api/network/wired", json={"interface": "eth0", "mode": "dhcp"}
+    )
+    assert res.status_code == 400, res.get_json()
+    said = res.get_json()["error"]
+    assert "install-service" in said, (
+        f"all the box's owner is told is to type a password it does not "
+        f"have: {said!r}"
+    )
+    assert trier.started == [], \
+        "it put a change on trial that was never written to the disk"
+
+
+def test_a_keep_the_box_cannot_start_using_is_shown_rather_than_only_recorded(box):
+    """A message with no branch to render it is a message nobody reads.
+
+    When the box finishes a keep for itself and then cannot make netplan use
+    those settings, it records that - `in_effect` false, and a sentence saying
+    to switch the box off and on again. Switching it off and on again is the
+    entire fix, and this panel is the only place anybody would ever be told.
+    There is no JavaScript runner in this suite, so this is the page's own
+    text: drawProbation has to have a branch for it.
+    """
+    client, _, _, _ = box
+    page = client.get("/dash").get_data(as_text=True)
+    drawer = page.split("function drawProbation")[1].split("function findTheBoxAgain")[0]
+
+    assert "in_effect" in drawer, (
+        "the box marks a keep it is not running yet and the page has no "
+        "branch that shows it, so the customer is never told to restart it"
+    )
+    assert "'kept'" in drawer, (
+        "nothing in the panel distinguishes a kept change from any other"
+    )
+
+
 # ==========================================================================
 # A change that was still on trial when the box lost power
 #
@@ -494,7 +565,7 @@ def _interrupted_change(tmp_path, previous):
     }))
 
 
-def _box_that_starts(tmp_path, monkeypatch, files, writer=None):
+def _box_that_starts(tmp_path, monkeypatch, files, writer=None, ran=None):
     root = tmp_path / "media"
     root.mkdir(exist_ok=True)
     make_show(root, "sitcoms", 1)
@@ -508,8 +579,11 @@ def _box_that_starts(tmp_path, monkeypatch, files, writer=None):
         writer if writer is not None else (lambda p, c: files.__setitem__(p, c)),
     )
     monkeypatch.setattr(netconf, "read_plan", lambda p: files.get(p))
+    recorded = ran if ran is not None else []
     monkeypatch.setattr(
-        netconf, "_run", lambda cmd, **k: (0, IP_JSON if "addr" in cmd else "", "")
+        netconf, "_run",
+        lambda cmd, **k: (recorded.append(list(cmd)),
+                          (0, IP_JSON if "addr" in cmd else "", ""))[1],
     )
     app = create_app(str(cfg))
     app.config.update(TESTING=True)
@@ -531,13 +605,80 @@ def test_a_change_interrupted_by_the_wall_switch_is_put_back_at_start_up(
     )
 
 
+def test_the_settings_put_back_at_start_up_are_also_put_into_effect(
+    tmp_path, runtime, monkeypatch
+):
+    """Rewriting the file is not what gets the box back on the network.
+
+    This is the box a customer typed a wrong static address into: it moved,
+    the browser lost it, nobody could press Undo, and it has been switched off
+    and on again. netplan applied the bad file at boot, so the bad
+    configuration is the live one. Putting the good file back and stopping
+    there leaves the box exactly as unreachable as it was, for another whole
+    session, with the good settings sitting on the disk unused.
+    """
+    files = {}
+    ran = []
+    _interrupted_change(tmp_path, {netconf.WIRED_FILE: "network: {the old one}\n"})
+
+    _box_that_starts(tmp_path, monkeypatch, files, ran=ran)
+
+    assert ["sudo", "-n", "netplan", "apply"] in ran, (
+        "the box put the old settings back on disk and went on running the "
+        "ones that took it off the network"
+    )
+
+
+def test_a_keep_the_box_never_finished_is_put_into_effect_at_start_up(
+    tmp_path, runtime, monkeypatch
+):
+    """The other half of the interrupted change, and the quieter failure.
+
+    The record says "keeping", which is written down before the newline that
+    commits the change - so the box stopped in that window. Whatever stopped
+    it took `netplan try`'s terminal with it, and netplan then put its own
+    configuration back. The netplan file on the disk still holds what the
+    customer kept, so the box is marked kept while running something else,
+    and nothing changes that until it is switched off and on again.
+    """
+    import json
+    import os
+
+    files = {netconf.WIRED_FILE: "network: {the kept one}\n"}
+    ran = []
+    (tmp_path / netprobation.STATE_NAME).write_text(json.dumps({
+        "phase": "keeping",
+        "note": "eth0: 192.168.1.99/24",
+        "handle": "netplan-try-from-a-dashboard-that-has-gone",
+        "owner_pid": os.getpid() + 1,
+        "previous": {netconf.WIRED_FILE: "network: {the old one}\n"},
+        "started_at": time.time(),
+        "timeout": 120,
+    }))
+
+    app = _box_that_starts(tmp_path, monkeypatch, files, ran=ran)
+
+    assert files[netconf.WIRED_FILE] == "network: {the kept one}\n", \
+        "it took away a change somebody kept"
+    assert ["sudo", "-n", "netplan", "apply"] in ran, (
+        "the box says those settings are kept and goes on running the ones "
+        "netplan put back when the dashboard died"
+    )
+    change = app.test_client().get("/api/network").get_json()["change"]
+    assert change["phase"] == "kept", change
+
+
 def test_a_box_with_nothing_in_flight_writes_no_network_files_at_start_up(
     tmp_path, runtime, monkeypatch
 ):
     # The common case, every boot: one small file read that finds nothing.
     files = {}
-    _box_that_starts(tmp_path, monkeypatch, files)
+    ran = []
+    _box_that_starts(tmp_path, monkeypatch, files, ran=ran)
     assert files == {}
+    assert ["sudo", "-n", "netplan", "apply"] not in ran, (
+        "every boot bounces the network of a box with nothing wrong with it"
+    )
 
 
 def test_the_dashboard_still_comes_up_when_it_cannot_put_the_change_back(
@@ -558,3 +699,74 @@ def test_the_dashboard_still_comes_up_when_it_cannot_put_the_change_back(
     client = app.test_client()
     assert client.get("/api/network").status_code == 200
     assert client.get("/dash").status_code == 200
+
+
+# ==========================================================================
+# What a refused command is allowed to say
+#
+# sudo's own words for a command it has no rule for are "a password is
+# required", on a box whose owner has no password, no keyboard and no way to
+# read an install log. That sentence reaching the browser is what made one
+# real unit's failure incomprehensible. It is translated once, in
+# servicectl.explain_failure, and nothing here repeats the original.
+# ==========================================================================
+def test_a_refused_hostname_change_does_not_quote_sudo_at_the_customer(
+    box, monkeypatch
+):
+    client, _, _, _ = box
+    monkeypatch.setattr(
+        "retrobox.servicectl._run",
+        lambda cmd, **k: (1, "sudo: a password is required"),
+    )
+    res = client.post("/api/network/hostname", json={"hostname": "loungetv"})
+    assert res.status_code == 503
+    said = res.get_json()["error"]
+    assert "sudo" not in said
+    assert "password" not in said
+    assert "install-service.sh" in said, "it does not say what would fix it"
+
+
+def test_a_hostname_change_that_failed_for_another_reason_keeps_its_reason(
+    box, monkeypatch
+):
+    """Translation is for sudo's words, not a blanket for everything."""
+    client, _, _, _ = box
+    monkeypatch.setattr(
+        "retrobox.servicectl._run",
+        lambda cmd, **k: (1, "Could not set static hostname: Read-only file system"),
+    )
+    said = client.post(
+        "/api/network/hostname", json={"hostname": "loungetv"}
+    ).get_json()["error"]
+    assert "Read-only file system" in said
+
+
+def test_a_refused_network_save_does_not_quote_sudo_at_the_customer(
+    box, monkeypatch
+):
+    client, _, _, _ = box
+
+    def refuse(path, content):
+        raise netconf.NetworkError(
+            "could not write the network configuration: sudo: a password is "
+            "required" + netconf.NEEDS_THE_INSTALLER_AGAIN
+        )
+
+    monkeypatch.setattr(netconf, "write_plan", refuse)
+    res = client.post("/api/network/wired", json={"interface": "eth0", "mode": "dhcp"})
+    said = res.get_json()["error"]
+    assert "sudo" not in said
+    assert "password" not in said
+    assert "install-service.sh" in said
+
+
+def test_a_network_change_refused_for_a_real_reason_still_says_what_it_was(
+    box, monkeypatch
+):
+    client, _, _, _ = box
+    res = client.post(
+        "/api/network/wired",
+        json={"interface": "eth0", "mode": "static", "address": "not an address"},
+    )
+    assert res.status_code == 400
+    assert "not an address" in res.get_json()["error"]

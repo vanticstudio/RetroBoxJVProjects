@@ -7,6 +7,40 @@
 #     retrobox --check
 #
 # There are two ways to define channels. Pick ONE.
+#
+# -----------------------------------------------------------------------------
+# A NOTE ON THE SETTINGS THAT ARE CHECKED RATHER THAN OBEYED
+# -----------------------------------------------------------------------------
+# The dashboard has no password - that is deliberate, it is the same trade a
+# LAN file share makes - and it can replace this whole file. So two kinds of
+# setting in here are checked against a fixed list instead of being taken as
+# written:
+#
+#   * ones that name a command the box runs: power_off_command,
+#     input.cec_binary, input.cec_osd_name;
+#   * ones that name a folder the box reads, writes or deletes inside:
+#     media_root, each channel's path, a daypart's path, bumpers, assets_dir,
+#     input.web_socket - and video_extensions, which is what tells the upload
+#     page what a video is.
+#
+# Four smaller ones get the same treatment for the same reason: boot_splash has
+# to name a video file, ui.font has to be a plain font name (it is spliced into
+# the on-screen display's own markup), audio_device may not contain control
+# characters, and input.keyboard_devices may only name things under /dev/input.
+#
+# A setting that does not pass is IGNORED, with the reason written to the
+# journal (`journalctl -u retrobox`), and the box carries on with the default.
+# It is never fatal: a config that refuses to load would take the picture away
+# on a machine nobody can log into, which is far worse. The dashboard does
+# refuse to SAVE a file like that, so you are told rather than left guessing.
+#
+# For folders: keep the library somewhere a library lives - an external drive
+# (/mnt/..., /media/...), a network share, or a folder in your home such as
+# ~/Videos. The system's own directories are refused (/etc, /boot, /usr, /opt,
+# the parts of /var that hold cron jobs and services), and so are the folder
+# Retro Box itself is installed in, its virtualenv, and your hidden dotfile
+# folders (~/.ssh, ~/.config and the like). Your home directory ITSELF is
+# refused too - use a folder inside it.
 
 # -----------------------------------------------------------------------------
 # OPTION A (easiest): auto-discover channels from a media folder.
@@ -37,6 +71,13 @@ channels:
     exclude_seasons: ["6-25"]      # drop seasons 6 through 25 (detected from
                                    #   names like S06E01, "Season 6", 6x01)
     exclude: ["*bonus*"]           # drop any file/folder whose path matches
+    # A channel whose `path` is media_root itself (nothing the box builds does
+    # this, but you can write one by hand) can see the box's own folders: the
+    # trash, the upload spool, the start-up clip. Left alone it would put
+    # everything you deleted straight back on the air, so the first time
+    # anything is deleted the box adds `.retrobox-trash/*`,
+    # `.retrobox-uploads/*` and `.welcome/*` to that channel's `exclude` for
+    # you and writes it to the log. Every other channel is left as written.
     # --- Dayparting (see the block below) ---
     # Music videos all day; after 10pm the same channel becomes something else.
     dayparts:
@@ -110,6 +151,9 @@ start_channel: 2          # which channel the box powers on to
 # --- Station bumpers ---------------------------------------------------------
 # A folder of short clips - idents, "we'll be right back", station promos - that
 # play between episodes and stitch the night together. Leave it unset for none.
+# A relative path is taken from media_root, so give it in full if you have not
+# set one - the folder this config file lives in is inside the installed
+# software, which is one of the places a folder of clips may not be.
 # bumpers: /media/retrobox/bumpers
 bumper_chance: 1.0        # 0-1: how often a bumper airs between episodes
 bumper_max_seconds: 30    # hard cap, so one stray long file can't stall the box
@@ -132,7 +176,8 @@ force_4_3: false
 # Start each episode a random number of seconds in, between these two values, so
 # channel switches land at varied points in the show (skips the black leader/
 # intro too). Use a single number for a fixed offset, e.g. `start_offset: 5`.
-# Set 0 if you genuinely want everything from the top.
+# Set 0 if you genuinely want everything from the top. (`start_offset_min` and
+# `start_offset_max` are accepted as separate keys and win over this one.)
 start_offset: [6, 10]
 
 # Channel-change effect: "none" (default), "glitch" (brief digital corruption),
@@ -150,6 +195,9 @@ guide_seconds: 8          # how long the on-screen channel guide stays up
 
 # --- On-screen display look (the green digital readouts) ---------------------
 ui:
+  # A plain font name: letters, digits, spaces, '.', '_' and '-'. It is
+  # spliced into the on-screen display's own markup, so anything else is
+  # ignored and VT323 is used.
   font: "VT323"           # bundled retro terminal font (installed by install.sh)
   color: "#4DFF5A"        # phosphor green for CH banner, volume bar, guide
   dim_color: "#123B18"    # unlit volume dots (the segments not yet filled)
@@ -165,6 +213,39 @@ crt:
   vignette: 0.25          # edge darkening (0-1)
   scanlines: true
   scanline_intensity: 0.12
+
+# --- Going quiet when the television is off ----------------------------------
+# The box sits in a cabinet behind the set. With the set off it was decoding
+# video for nobody: a fan roaring into an empty room and heat pumped into
+# hardware that has already had one life. When it can see that nothing is
+# watching, it PAUSES the picture - mpv stays running, the dashboard stays
+# accurate, and it comes straight back.
+#
+# How it knows: the kernel says whether anything is plugged into the video
+# output, and - only if this box has an HDMI-CEC adapter - the television's own
+# word about its power. It never guesses: if it cannot tell, it stays awake.
+# Some televisions keep the HDMI connection alive on standby and only drop it
+# when switched off at the wall, so on those sets nothing happens without CEC.
+display_sleep:
+  # OFF until the dashboard half of this ships. The television side is
+  # finished and works; what does not exist yet is the dashboard panel that
+  # shows you the box has gone quiet and gives you a Wake button to bring it
+  # back. Without that, a television that stayed black would look like a
+  # broken box rather than a working one - so this waits for its other half.
+  # Turn it on here if you want it now; everything below applies either way.
+  enabled: false
+  # How long the video output has to have been gone before the box believes
+  # it. This is a debounce, not a countdown: switches and receivers drop the
+  # line for a moment while they change input, and every one of those looks
+  # like somebody switching the television off. Waking is never delayed.
+  sleep_after_seconds: 8
+  # What a channel that is NOT in broadcast mode does when the box wakes.
+  # (A broadcast channel needs no setting: it works out what is airing from
+  # the clock, so it always comes back where the station has got to.)
+  #   resume  - carry on exactly where the picture was paused
+  #   advance - skip forward by however long the box was quiet, because
+  #             television does not wait for you
+  non_broadcast: resume
 
 # --- Audio -------------------------------------------------------------------
 initial_volume: 70        # 0-100
@@ -187,6 +268,13 @@ power_off_on_min_volume: true
 
 # --- Playback ----------------------------------------------------------------
 scan_recursive: true      # also look inside season sub-folders for episodes
+# shuffle: true           # the DEFAULT for every channel that doesn't say.
+                          #   A channel's own `shuffle:` always wins.
+# Which files count as an episode. This is also what the upload page uses to
+# decide what it is allowed to write to the disk, so only real video container
+# suffixes are accepted - .mp4 .m4v .mkv .avi .mov .webm .ts .m2ts .mts .mpg
+# .mpeg .vob .ogv .divx .flv .wmv .asf .3gp .mxf and the like. A list with
+# anything else in it is ignored in full and the usual set is used.
 # video_extensions: [".mp4", ".mkv", ".avi", ".m4v"]   # override if needed
 # shuffle_seed: 1234       # set for a repeatable shuffle order (mostly for tests)
 
@@ -197,9 +285,28 @@ input:
   keyboard: true          # USB/IR remotes & keyboards (via Linux evdev)
   cec: true               # the TV's own remote over HDMI-CEC (needs cec-utils)
   stdin: false            # developer keyboard over the terminal
+  web: true               # the local socket the dashboard's buttons arrive on.
+                          #   Set false and the WATCH tab's remote stops working;
+                          #   everything else on the dashboard carries on.
   # keyboard_name_filter: "remote"   # only listen to devices whose name matches
   # keyboard_devices: ["/dev/input/event0"]  # or pin exact devices
+  #   (must be under /dev/input - that is the only place a remote can be)
   # keyboard_grab: false             # true = stop keystrokes leaking to console
+
+  # HDMI-CEC. cec_binary is the SECOND setting in this file that names a
+  # program the box runs, so like power_off_command it is checked rather than
+  # obeyed: it has to be libCEC's client ("cec-client", or a full path to
+  # one). cec_osd_name is handed to that same command line as an argument, so
+  # it is up to 14 plain characters starting with a letter or a digit - it is
+  # what your TV shows in its input list. Neither is normally needed.
+  # cec_binary: cec-client
+  # cec_osd_name: "Retro Box"
+
+  # Where the TV listens for the dashboard's button presses. Left unset it
+  # goes in the systemd runtime directory, which is right on a real box. If
+  # you do set it, it has to be an absolute path ending in ".sock" - whatever
+  # it names is deleted at start-up before the socket is bound.
+  # web_socket: /run/user/1000/retrobox/control.sock
 
   # Map specific keys to actions (handy for odd remotes). Find a button's key
   # name with `sudo evtest`. Actions: channel_up, channel_down, volume_up,
@@ -277,17 +384,77 @@ input:
 #
 # Checking and applying are separate on purpose. Checking is harmless. Applying
 # on its own is not: one bad release would take out every box at the same
-# moment, in living rooms, with no way in to fix them. So auto_apply is off,
-# and it should stay off until the rollback has been proven on real hardware.
+# moment, in living rooms, with no way in to fix them. So installing is always a
+# button press on the dashboard, and nothing in this file can change that.
+#
+# `auto_apply` is accepted here and reported by the dashboard, but NOTHING READS
+# IT to install anything - there is no self-applying path in the code at all.
+# It is left documented rather than removed because a config that sets it to
+# true loads without complaint and still never self-updates, and that is worth
+# knowing before you rely on it in either direction.
 #
 # A box with no internet is unaffected either way - the check fails quietly and
 # the television carries on.
 #
 # updates:
 #   check: true              # look for new versions (default: true)
-#   auto_apply: false        # install them without asking (default: false)
+#   auto_apply: false        # accepted, reported, and acted on by nothing
 #   check_interval_hours: 24 # how often to look, smeared so a fleet does not
 #                            #   all arrive at GitHub in the same second
+
+
+# ---------------------------------------------------------------------------
+# The clock
+# ---------------------------------------------------------------------------
+# This matters more here than on most machines. Dayparts (above) change what a
+# channel IS by the time of day, and they do it silently: a box on the wrong
+# timezone does not error, it just plays cartoons at ten at night and the
+# feature looks broken.
+#
+# Nothing ever tells a freshly installed box where in the world it is. Ubuntu's
+# systemd-timesyncd gets the box correct UTC, but the timezone stays on the
+# installer's default. So the first time it starts up, the box asks a public
+# internet service which timezone its internet address is in, and sets it - a
+# named zone like Australia/Melbourne, never a fixed offset, because a named
+# zone gets daylight saving right forever and an offset is wrong for half of
+# every year.
+#
+# WHAT THAT SENDS. This is the only thing about the clock that leaves the box.
+# It is the request and nothing else: no name, no serial number, no version,
+# nothing about you and nothing about what you watch. The service sees the same
+# public internet address your web browser shows any website. It happens once,
+# and again only if the box is moved onto a different connection - not on every
+# start-up, so a box behind a VPN does not go wandering between timezones.
+#
+# It NEVER overrides a timezone somebody chose. Pick one on the dashboard's
+# System page and that is the end of it: detection may say what it thinks, but
+# it will not change it back.
+#
+# Set this to false and the box never makes that request at all. It also never
+# works out its own timezone, so set one yourself on the System page - which is
+# also what a box with no internet needs.
+#
+# time:
+#   detect_timezone: true    # work the timezone out from this box's location
+#
+# A FLAT BATTERY. Separately from any of the above: if the dashboard says this
+# box's clock is wrong, and it is wrong again every time the box is switched
+# off at the wall, the coin-sized battery on the motherboard is flat. It is a
+# CR2032, about two dollars, and any computer shop will fit one. Until then a
+# box with internet fixes its own clock a few seconds after it starts; a box
+# without internet plays the wrong things all day.
+
+
+# ---------------------------------------------------------------------------
+# Where the generated filler clips live
+# ---------------------------------------------------------------------------
+# The colour bars, static and glitch clips that scripts/install.sh generates,
+# and where the dashboard puts a boot splash you upload. Left unset it is the
+# folder inside the installed software, which is where the shipped clips are
+# and is almost always what you want. It is one of the folders the box WRITES
+# into, so it is checked the same way media_root is - the bundled folder is
+# allowed through explicitly, anywhere else has to be a sensible place.
+# assets_dir: /media/retrobox/.retrobox-assets
 
 
 # ---------------------------------------------------------------------------

@@ -188,6 +188,53 @@ def test_a_new_audio_device_is_applied_without_a_restart(box):
     assert player.audio_device == "alsa/hdmi:CARD=PCH,DEV=0"
 
 
+def test_a_new_curvature_reaches_the_picture_without_a_restart(box):
+    """Curvature has no correct value - it is judged by eye, on the television.
+
+    Anyone setting it drags the slider and looks. If the change only lands on
+    the next restart, the slider is a control that appears to do nothing.
+    """
+    app, player, cfg, root = box
+    app.start()
+    rewrite(
+        cfg, root,
+        [(2, "Sitcoms", root / "sitcoms"), (5, "Movies", root / "movies")],
+        crt="{enabled: true, curvature: 0.34}",
+    )
+    app.handle_event(InputEvent(Action.RELOAD))
+
+    assert player.crt is not None
+    assert player.crt.curvature == pytest.approx(0.34)
+
+
+def test_turning_the_crt_effect_off_reaches_the_picture_without_a_restart(box):
+    app, player, cfg, root = box
+    app.start()
+    rewrite(
+        cfg, root,
+        [(2, "Sitcoms", root / "sitcoms"), (5, "Movies", root / "movies")],
+        crt="{enabled: false}",
+    )
+    app.handle_event(InputEvent(Action.RELOAD))
+
+    assert player.crt is None
+    assert player.crt_applied[-1] is None
+
+
+def test_a_reload_that_changes_nothing_about_the_picture_leaves_the_shader_alone(box):
+    """Every dashboard save comes through here.
+
+    Re-applying the same effect makes mpv recompile the shader, which is a
+    visible hitch on this hardware - so renaming a channel must not do it.
+    """
+    app, player, cfg, root = box
+    app.start()
+    rewrite(cfg, root, [(2, "Comedy", root / "sitcoms"), (5, "Movies", root / "movies")])
+    app.handle_event(InputEvent(Action.RELOAD))
+
+    assert player.crt_applied == []
+
+
 def test_a_new_sleep_ladder_is_live(box):
     app, player, cfg, root = box
     app.start()

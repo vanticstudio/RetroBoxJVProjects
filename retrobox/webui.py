@@ -32,15 +32,16 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__ as retrobox_version
 from . import (
-    branding, journal, netconf, netprobation, schedule, servicectl, static_gen,
-    sysinfo, updates,
+    branding, journal, library, netconf, netprobation, schedule, servicectl,
+    static_gen, sysinfo, timekeeping, updates, webstyle,
 )
 from .config import ChannelConfig, Config, ConfigError, UpdateConfig, load_config
 from .configstore import ConfigStore
@@ -72,9 +73,11 @@ from .uploads import (
 log = logging.getLogger(__name__)
 
 # The phosphor green from the on-screen display, so the page reads as part of
-# the same product rather than a bolted-on admin panel.
-GREEN = "#4DFF5A"
-DIM = "#123B18"
+# the same product rather than a bolted-on admin panel. Both live in webstyle
+# now, next to the stylesheet that splices them in; re-exported here because
+# this is where anything wanting the product colours has always looked.
+GREEN = webstyle.GREEN
+DIM = webstyle.DIM
 
 # Bounds on everything that can arrive from the network.
 MAX_CHANNEL_NUMBER = 999
@@ -108,6 +111,23 @@ UPDATE_STATE_NAME = ".retrobox-update.json"
 #: a box that never settles an interrupted network change.
 NETWORK_STATE_NAME = netprobation.STATE_NAME
 
+#: What this box knows about its own clock - whether it woke up believing it
+#: was 2011, and who chose the timezone it is running. Beside the config for
+#: the same reasons as the two above, and named by the module that owns the
+#: file so the two names cannot drift apart.
+TIME_STATE_NAME = timekeeping.STATE_NAME
+
+#: How many things one file-manager request may act on. Select-all on a folder
+#: of six hundred episodes is an ordinary thing to do, so the number is
+#: generous; it exists because a request that names a hundred thousand paths
+#: is not a customer, and each one costs a walk of the disk.
+MAX_LIBRARY_SELECTION = 1000
+
+#: How full a disk has to be before the file manager stops treating free space
+#: as a detail and starts leading with it. Below a tenth left, "this will not
+#: free anything" is the most important sentence on the confirmation.
+LIBRARY_DISK_TIGHT = 0.10
+
 # Port 80, so the address a customer types has no port in it. The systemd
 # unit grants CAP_NET_BIND_SERVICE so this works without running as root.
 DEFAULT_PORT = 80
@@ -119,12 +139,233 @@ SETTABLE = ("audio_device", "initial_volume", "auto_channels", "sleep_timer")
 RESTART_REQUIRED = ("auto_channels",)
 
 
+# ==========================================================================
+# Can this box still do the things this page offers?
+#
+# The permission to reboot, set the clock and write a network file is granted
+# once, by the installer, and nothing rewrites it when this code grows a
+# command it did not have before. One sold unit had only the older rule on it:
+# it installed cleanly, booted cleanly, played video cleanly, and weeks later
+# Shut Down worked while Restart, Reboot and the whole Network page came back
+# with "sudo: interactive authentication is required" - to somebody with no
+# keyboard, no SSH and no install log. servicectl answers whether that has
+# happened; what follows is how this page says so, and what it is allowed to
+# do about it.
+# ==========================================================================
+#: How long one answer is trusted before sudo is asked again.
+#:
+#: The check is twenty-one short-lived processes on a Raspberry Pi that is
+#: playing video, and this page has no login - so whatever triggers it is
+#: triggerable by anyone on the network, as fast as they can hold down F5.
+#: This is the ceiling on that: one round of asking every half minute per
+#: dashboard, however many people press the button. It is short enough that
+#: somebody who has just typed the command on the box and come back to the
+#: page is not left looking at yesterday's answer for long.
+PRIVILEGE_CHECK_TTL = 30.0
+
+#: The environment variable systemd sets for every service it starts, and the
+#: only way this process can tell "the appliance is booting" from "somebody
+#: imported this module".
+#:
+#: The start-up check is for the first. A checkout and the test suite build
+#: this app object over and over, and asking sudo twenty-one questions each
+#: time is a cost neither of them should pay for a fault neither of them can
+#: have - the fault needs an installed box, and an installed box is one this
+#: dashboard was started on by systemd (scripts/retrobox-web.service). It is
+#: also the difference between a suite that runs and one that does not:
+#: tests/conftest.py refuses any command naming systemctl against the real
+#: checkout, and `sudo -n -l -- /usr/bin/systemctl reboot` names it.
+#:
+#: A dashboard started by hand on a real box loses nothing that matters: the
+#: same check runs when somebody opens the System page, which is where the
+#: answer is read.
+STARTED_BY_SYSTEMD = "INVOCATION_ID"
+
+#: What is actually printed on the buttons behind each group of privileges.
+#:
+#: servicectl says which GROUPS sudo refused, in the words a customer would
+#: use for them ("the Power buttons"). Only this file knows what those buttons
+#: are called on the screen, and "some features are unavailable" is not
+#: something anybody standing in front of a television can act on.
+PRIVILEGE_BUTTONS: Dict[str, Tuple[str, ...]] = {
+    "service": (
+        "RESTART THE TV", "RESTART DASHBOARD", "REBOOT THE BOX", "SHUT DOWN",
+    ),
+    "timezone": ("the Timezone picker under Clock",),
+    "network": ("JOIN A WIFI NETWORK", "WIRED SETTINGS", "Keep, on a network change"),
+    "scan": ("the list of networks JOIN A WIFI NETWORK looks for",),
+    "hostname": ("changing what this box is called, under Network",),
+}
+
+
+def _for_a_customer(exc: Exception, *, action: Optional[str] = None) -> str:
+    """Whatever went wrong, in words somebody in front of a television can use.
+
+    Only sudo's refusals are rewritten - "git fetch failed: sudo: a password
+    is required" becomes the sentence saying what actually fixes it - and
+    everything else keeps its own words, because "could not read from remote
+    repository" is genuinely the useful thing to say. The original always goes
+    to the journal, which is where the paths and the machine's own words are
+    of use to somebody.
+    """
+    said = str(exc)
+    if not servicectl.is_permission_problem(said):
+        return said
+    # "a privileged command was refused", not "refused by sudo:" - this line
+    # is read back through _without_sudos_own_words() on the way to the System
+    # tab and the support bundle, and that scrubber cuts from the first
+    # "sudo:" on the line. Writing our own prefix that way made this box's own
+    # words the first casualty of its own scrubber.
+    log.warning("a privileged command was refused: %s", said)
+    return servicectl.permission_message(action)
+
+
+def privilege_buttons(affected: Sequence[str]) -> List[str]:
+    """The buttons that will fail, given the groups servicectl says are refused.
+
+    ``affected`` arrives as the customer-facing group labels, so it is turned
+    back into group names through servicectl's own table - one list, so a
+    group added there cannot quietly go unnamed here.
+    """
+    groups = {label: group for group, label in servicectl.GROUP_LABELS.items()}
+    named: List[str] = []
+    for label in affected:
+        for button in PRIVILEGE_BUTTONS.get(groups.get(label, ""), ()):
+            if button not in named:
+                named.append(button)
+    return named
+
+
+#: What a state means for the page, in one word, for the support bundle.
+PRIVILEGE_STATES = {
+    servicectl.PRIVILEGES_OK: "in place",
+    servicectl.PRIVILEGES_MISSING: "never granted",
+    servicectl.PRIVILEGES_STALE: "out of date",
+    servicectl.PRIVILEGES_BLOCKED: "granted, but this box cannot act on it",
+}
+
+#: The state of a box that has not been asked, or could not be. It is not a
+#: fault report: a check that fell over is this dashboard's problem, not
+#: something to put a red banner about in front of a customer.
+PRIVILEGES_UNKNOWN = "unknown"
+
+
+def privilege_answer(check: Optional[servicectl.PrivilegeCheck]) -> Dict[str, Any]:
+    """One privilege check, as the page is allowed to see it.
+
+    ``.refused`` and ``.detail`` are deliberately not here. They carry the
+    paths sudo was asked about and sudo's own words for refusing, which is
+    exactly the text that made one customer's box incomprehensible. They go to
+    the journal, where somebody who can read them is looking.
+    """
+    if check is None:
+        return {
+            "state": PRIVILEGES_UNKNOWN,
+            "needs_repair": False,
+            "repairable": False,
+            "headline": "",
+            "message": "",
+            "affected": [],
+            "buttons": [],
+            "command": servicectl.FIX_COMMAND,
+            "user": servicectl.current_user(),
+        }
+    return {
+        "state": check.state,
+        "needs_repair": check.needs_repair,
+        # Re-generating the fragment is the fix for a grant that is missing or
+        # too small. It is NOT the fix for a box where sudo cannot become root
+        # at all - that is the service unit, a different job - so that state
+        # gets the explanation and no button, rather than a button that sends
+        # somebody round a loop which cannot end.
+        "repairable": check.state in (
+            servicectl.PRIVILEGES_MISSING, servicectl.PRIVILEGES_STALE
+        ),
+        "headline": check.headline if check.needs_repair else "",
+        "message": check.message if check.needs_repair else "",
+        "affected": list(check.affected),
+        "buttons": privilege_buttons(check.affected),
+        "command": check.command,
+        # The account the rule has to name, and the one to be signed in as when
+        # typing the command. Read from this process, never from a request.
+        "user": servicectl.current_user(),
+    }
+
+
 class ApiError(Exception):
     """A bad request, with the status code to answer it with."""
 
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
         self.status = status
+
+
+def _library_status(exc: Exception) -> int:
+    """Which HTTP code a refusal from :mod:`retrobox.library` deserves.
+
+    ``catastrophic`` is asked first and on purpose. Every exception that
+    module raises inherits from ``LibraryError``, including ``HalfRenamed`` -
+    the one state where a folder moved and config.yaml did not, which leaves a
+    channel pointed at a name that is no longer on the disk. Branching on
+    except-clause order would report that as a 400 "you asked for something
+    silly", and a customer would go looking for their own mistake. It is a
+    500, it is the server's fault, and its message is the only thing that
+    connects a black channel to a rename, so it is passed through word for
+    word and written to the log at error.
+    """
+    if getattr(exc, "catastrophic", False):
+        log.error("%s", exc)
+        return 500
+    if isinstance(exc, library.LibraryNotFound):
+        return 404
+    if isinstance(exc, (library.LibraryConflict, library.LibraryBusy)):
+        return 409
+    return 400
+
+
+#: Every knob the CRT shader is generated from: the name the browser sends,
+#: the name the television's control socket knows it by, and the range
+#: config.py allows. Numbers get a low and a high; the two switches get None.
+#:
+#: One table, read by both the Save route and the live-preview route, because
+#: they are the same six settings taking the same six values and a bound that
+#: meant one thing on the way to config.yaml and another on the way to the
+#: screen would show a customer a picture they cannot then save.
+_CRT_SETTINGS: Tuple[Tuple[str, str, Optional[float], Optional[float]], ...] = (
+    ("crt_enabled",        "enabled",            None, None),
+    ("curvature",          "curvature",          0.0,  0.5),
+    ("corner_radius",      "corner_radius",      0.0,  0.3),
+    ("vignette",           "vignette",           0.0,  1.0),
+    ("scanlines",          "scanlines",          None, None),
+    ("scanline_intensity", "scanline_intensity", 0.0,  1.0),
+)
+
+
+def _crt_from_body(body: Dict[str, Any]) -> Dict[str, Any]:
+    """The picture settings a request actually asked to change, checked.
+
+    Only the ones that are present: a dashboard dragging one control sends the
+    control that moved, and both the config merge and the television's own
+    preview merge are built on that. Out of range is refused rather than
+    clamped, where somebody is looking at the screen, rather than silently
+    rounded on the next load.
+    """
+    settings: Dict[str, Any] = {}
+    for key, name, low, high in _CRT_SETTINGS:
+        if key not in body:
+            continue
+        raw = body[key]
+        if low is None:
+            if not isinstance(raw, bool):
+                raise ApiError(f"{key} is true or false")
+            settings[name] = raw
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ApiError(f"{key} must be a number")
+        if not low <= float(raw) <= high:
+            raise ApiError(f"{key} must be between {low} and {high}")
+        settings[name] = float(raw)
+    return settings
 
 
 def stream_to_file(stream: Any, out: Any, *, declared: int, limit: int) -> int:
@@ -263,6 +504,18 @@ def _mb(value: Optional[int]) -> str:
     return f"{value / 1024**2:.0f} MB"
 
 
+def _trash_line(trash: Optional[Dict[str, Any]]) -> str:
+    """The trash, for the support bundle. Part of the storage block, not a note."""
+    if not trash:
+        return "  trash: not known"
+    if not trash.get("items"):
+        return "  trash: empty"
+    return (
+        f"  trash: {trash['items']} item(s), {_mb(trash.get('bytes'))} "
+        f"- still on the disk until it is emptied"
+    )
+
+
 def _volume_line(label: str, volume: Optional[Dict[str, Any]]) -> str:
     if volume is None:
         return f"  {label}: could not be read"
@@ -271,6 +524,72 @@ def _volume_line(label: str, volume: Optional[Dict[str, Any]]) -> str:
         f"{_mb(volume['total_bytes'])} ({volume['percent_used']}% used)"
         f"{'  <-- ' + volume['state'].upper() if volume['state'] != 'ok' else ''}"
     )
+
+
+#: Everything sudo writes about itself is prefixed with its own name. The
+#: privilege check puts those words in the journal on purpose - somebody who
+#: can act on "effective uid is not 0" reads them there - but those same
+#: journal lines are read by the owner in two places that are not a journal:
+#: the log panel on the System tab, and the tail of the support bundle, which
+#: is a document a customer generates, reads and pastes into an email. Without
+#: this, the exact sentence the permission banner exists to keep off a
+#: customer's screen arrives on it by the back door.
+#:
+#: WHAT GOES: "sudo:" and everything after it to the end of that line. It runs
+#: to the end of the line rather than stopping at the next comma or semicolon
+#: because sudo's own sentences contain both - "a terminal is required to read
+#: the password; either use the -S option..." is one message, and a scrubber
+#: that guesses where a sentence ends is a scrubber that lets half of one out.
+#:
+#: WHAT STAYS: everything BEFORE "sudo:" on the line, which is this box's own
+#: words for what it was doing; and every absolute path that was inside the
+#: part removed. A path is a fact about this machine, not a sentence anybody
+#: could act on wrongly, and "/etc/sudoers.d/retrobox-system" or
+#: "/usr/bin/systemctl" is the half of the line that makes a support
+#: conversation possible at all. Scrubbing to nothing would be safe and
+#: useless.
+_SUDO_SPEAKS = re.compile(r"\bsudo:\s*[^\n]*")
+#: An absolute path: a slash, a letter, and then the rest of it. It ends on a
+#: character a sentence would not, because a trailing full stop or comma
+#: belongs to the prose around the path and not to the file name. Starting on
+#: a letter keeps "12/25" and the tail of a URL out of it.
+_A_PATH = re.compile(r"/[A-Za-z][A-Za-z0-9._/+-]*[A-Za-z0-9_+-]")
+_SUDO_REMOVED = "[sudo's own words - see the box's journal]"
+
+
+def _without_sudos_own_words(message: str) -> str:
+    """A journal line with anything sudo said about itself taken back out.
+
+    Used by the live log route and by the support bundle, so the two cannot
+    drift into showing a customer different amounts of the same line.
+    """
+    if not isinstance(message, str):
+        return ""
+
+    def replace(match: "re.Match[str]") -> str:
+        kept = _A_PATH.findall(match.group(0))
+        return " ".join([_SUDO_REMOVED] + kept)
+
+    return _SUDO_SPEAKS.sub(replace, message)
+
+
+def _log_entries_for_reading(entries: Any) -> List[Dict[str, Any]]:
+    """Journal entries with sudo's own words taken out of each message.
+
+    The journal module hands back exactly what journalctl said, which is
+    right: it is a log reader, and the only other caller is the box itself.
+    The scrubbing belongs here, at the two doors a customer reads through.
+    """
+    if not isinstance(entries, list):
+        return []
+    cleaned = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        cleaned.append(
+            {**entry, "message": _without_sudos_own_words(entry.get("message", ""))}
+        )
+    return cleaned
 
 
 def _support_bundle(report: Dict[str, Any], entries: Optional[List[Dict]] = None) -> str:
@@ -282,6 +601,7 @@ def _support_bundle(report: Dict[str, Any], entries: Optional[List[Dict]] = None
     """
     if entries is None:
         entries = journal.read(lines=200).get("entries", [])
+    entries = _log_entries_for_reading(entries)
 
     where = report.get("addresses") or {}
     storage = report.get("storage") or {}
@@ -301,10 +621,20 @@ def _support_bundle(report: Dict[str, Any], entries: Optional[List[Dict]] = None
         f"TV uptime:    {_duration(report.get('tv_uptime_seconds'))}",
         f"Channels:     {report.get('channel_count') if report.get('channel_count') is not None else 'unknown'}",
         f"Config:       {report.get('config_path', 'unknown')}",
+        # Whether this box can still do the privileged half of its job, in the
+        # words of the state and nothing else. Never what sudo said: this
+        # block gets pasted into an email by a customer, so it is held to the
+        # same rule as the page. It reports the last answer and never goes
+        # asking for a fresh one - this is a GET on a page with no login.
+        f"Permission:   {PRIVILEGE_STATES.get(str(report.get('privileges') or ''), 'not checked')}",
         "",
         "Storage",
         _volume_line("root ", storage.get("root")),
         _volume_line("media", storage.get("media")),
+        # Counted in "used" on the media line above, and invisible everywhere
+        # else. A support conversation that starts "the disk is full" needs
+        # this number in the first block, not on the third phone call.
+        _trash_line(report.get("trash")),
         "",
         "Hardware",
         f"  GPU:      {hardware.get('gpu_description', 'unknown')}",
@@ -330,7 +660,8 @@ def _support_bundle(report: Dict[str, Any], entries: Optional[List[Dict]] = None
     for entry in entries:
         lines.append(
             f"{entry.get('time', '')}  {entry.get('level', ''):<8}"
-            f"{entry.get('unit', '')}: {entry.get('message', '')}"
+            f"{entry.get('unit', '')}: "
+            f"{entry.get('message', '')}"
         )
     if not entries:
         lines.append("(no log entries available - is this box running systemd?)")
@@ -488,6 +819,7 @@ def create_app(config_path: Optional[str] = None):
 
     # Looks for a newer release on a timer, off the main thread, and never
     # blocks anything. A box with no internet simply never gets an answer.
+    _startup_config: Optional[Config] = None
     try:
         _startup_config = store.load()
         _update_settings = _startup_config.updates
@@ -499,6 +831,24 @@ def create_app(config_path: Optional[str] = None):
         enabled=_update_settings.check,
     )
     checker.start()
+
+    # Reclaim anything the trash has been holding for a fortnight. At start-up
+    # rather than on a timer, because this box is switched off at the wall: a
+    # unit that spends six days a week unplugged would never reach the hour a
+    # timer fired at, and would quietly fill up with things its owner deleted
+    # last spring. Guarded completely - a box that cannot tidy up still has to
+    # serve its dashboard.
+    try:
+        _media_root = _startup_config.media_root if _startup_config else None
+        if _media_root is not None:
+            _swept = library.sweep_trash(_media_root)
+            if _swept["items"]:
+                log.info(
+                    "reclaimed %d item(s) the trash had held longer than %d days",
+                    _swept["items"], library.DEFAULT_TRASH_DAYS,
+                )
+    except Exception:  # noqa: BLE001 - housekeeping never stops the server
+        log.warning("could not sweep the trash at start-up", exc_info=True)
 
     # -- plumbing ----------------------------------------------------------
     @app.errorhandler(ApiError)
@@ -514,6 +864,10 @@ def create_app(config_path: Optional[str] = None):
     def _handle_unsafe_path(exc: UnsafePath):
         return jsonify({"ok": False, "error": str(exc)}), 400
 
+    @app.errorhandler(library.LibraryError)
+    def _handle_library_error(exc: library.LibraryError):
+        return jsonify({"ok": False, "error": str(exc)}), _library_status(exc)
+
     @app.errorhandler(ScheduleError)
     def _handle_schedule_error(exc: ScheduleError):
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -524,7 +878,15 @@ def create_app(config_path: Optional[str] = None):
 
     @app.errorhandler(NetworkError)
     def _handle_network_error(exc: NetworkError):
-        return jsonify({"ok": False, "error": str(exc)}), 400
+        # Most of these are somebody mistyping an address, and those keep
+        # their own words. The one that does not is a write sudo refused: a
+        # box set up before the netplan staging file existed has a rule that
+        # names the live file and nothing else, so the first privileged step
+        # of a save comes back as "sudo: a password is required" - which sends
+        # the owner of a box that has no password looking for one. Translated
+        # here, at the one place every network route's message becomes a page,
+        # rather than in five routes that could each forget.
+        return jsonify({"ok": False, "error": _for_a_customer(exc, action="network")}), 400
 
     @app.errorhandler(UploadError)
     def _handle_upload_error(exc: UploadError):
@@ -571,8 +933,16 @@ def create_app(config_path: Optional[str] = None):
         ok = send_command(command)
         return jsonify({"ok": ok, "sent": command}), (200 if ok else 503)
 
-    def _saved(config: Config, extra: Optional[Dict[str, Any]] = None, status: int = 200):
-        """Answer a successful config change, and nudge the TV to reload it."""
+    def _saved(config: Config, extra: Optional[Dict[str, Any]] = None, status: int = 200,
+               *, applied_note: Optional[str] = None):
+        """Answer a successful config change, and nudge the TV to reload it.
+
+        ``applied_note`` is for a change the television acts on the instant it
+        reloads - the CRT picture effect is the one that does. It is used only
+        when the reload was actually delivered, because "look at the
+        television" said to somebody whose television is not running is the
+        same kind of lie as the restart warning it replaced.
+        """
         applied = send_command("reload")
         body = {
             "ok": True,
@@ -584,6 +954,8 @@ def create_app(config_path: Optional[str] = None):
         }
         if not applied:
             body["note"] = "saved - the TV is not running, so it will apply at next start"
+        elif applied_note:
+            body["note"] = applied_note
         body.update(extra or {})
         return jsonify(body), status
 
@@ -1003,6 +1375,353 @@ def create_app(config_path: Optional[str] = None):
             "files": _media_files(config, channel.path),
         })
 
+    # -- the library: browse, rename, delete, and the trash -----------------
+    #
+    # Everything a customer would otherwise need SSH, Samba or a file manager
+    # for. :mod:`retrobox.library` is the engine and holds every rule about
+    # what may move where; these routes are the part that knows about HTTP,
+    # about confirmations, and about telling the television.
+    #
+    # Nothing here trusts a path. There is no login on this dashboard, so a
+    # path in a request body is a string an attacker on the LAN wrote, and
+    # every one of them goes through safepath - inside the library module,
+    # which is where the single shared guard lives. Not one of these routes
+    # joins a request string onto the media root itself.
+    def _library() -> Tuple[Config, Path]:
+        """The config and the media root, or a refusal somebody can act on."""
+        config = _need_config()
+        if config.media_root is None:
+            raise ApiError(
+                "set media_root in config.yaml before managing files from here"
+            )
+        return config, Path(config.media_root)
+
+    def _library_paths(body: Dict[str, Any]) -> List[str]:
+        """The things a request asked to act on, de-duplicated, still hostile.
+
+        Only the shape is settled here - that it is a list of strings and not
+        an absurd number of them. What the strings mean is the library's
+        business, and it refuses them one at a time.
+        """
+        raw = body.get("paths", body.get("path"))
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list) or not raw:
+            raise ApiError("nothing was selected")
+        if len(raw) > MAX_LIBRARY_SELECTION:
+            raise ApiError(
+                f"that is more than {MAX_LIBRARY_SELECTION} things in one go"
+            )
+        wanted: List[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                raise ApiError("that is not a path")
+            if item not in wanted:
+                wanted.append(item)
+        return wanted
+
+    def _same_folder(one: Optional[Path], two: Path) -> bool:
+        try:
+            return one is not None and os.path.realpath(str(one)) == os.path.realpath(str(two))
+        except OSError:  # pragma: no cover - hostile filesystem
+            return False
+
+    def _teach_channels_to_ignore_the_machinery(config: Config, root: Path) -> List[int]:
+        """Stop a channel pointed at the media root from playing the trash.
+
+        ``scan_episodes`` skips hidden *files*, not hidden *folders*. Nothing
+        on this box creates a channel whose folder is the media root itself,
+        but a person can write one by hand - and such a channel walks straight
+        into ``.retrobox-trash`` and puts every deleted episode back on the
+        air. The library module publishes the patterns that close it and
+        cannot apply them, because only config.yaml can, so this is the one
+        place that can: it knows a delete is about to happen.
+
+        Rewriting config.yaml costs the customer every comment in it, so this
+        runs only when there is genuinely something to fix - the same rule
+        ``library.rename_folder`` holds itself to. Returns the channel numbers
+        that were changed, so the answer can say so out loud.
+        """
+        exposed = []
+        for channel in config.channels:
+            places = [channel.path] + [p.path for p in channel.dayparts]
+            if not any(_same_folder(place, root) for place in places):
+                continue
+            if all(glob in channel.exclude for glob in library.MACHINERY_GLOBS):
+                continue
+            exposed.append(channel.number)
+        if not exposed:
+            return []
+
+        def mutate(data: Dict[str, Any]) -> None:
+            for entry in ConfigStore.channels_of(data):
+                try:
+                    number = int(entry.get("number", -1))
+                except (TypeError, ValueError):  # pragma: no cover - loader fills it
+                    continue
+                if number not in exposed:
+                    continue
+                current = [str(p) for p in (entry.get("exclude") or [])]
+                entry["exclude"] = current + [
+                    glob for glob in library.MACHINERY_GLOBS if glob not in current
+                ]
+
+        store.update(mutate)
+        log.warning(
+            "channels %s play from the media root itself, so they could see the "
+            "trash; they now exclude the box's own folders", exposed,
+        )
+        return exposed
+
+    def _library_warnings(
+        items: List[Dict[str, Any]], space: Dict[str, Any]
+    ) -> List[str]:
+        """The sentences a confirmation dialog must not be allowed to omit.
+
+        Written here rather than in the browser because they are the whole
+        point of the confirmation, and a page can be reloaded mid-edit,
+        rewritten by the next feature, or read by a person who never sees the
+        dialog at all. The route that knows the consequence says the
+        consequence.
+        """
+        said: List[str] = []
+        affected: Dict[int, Dict[str, Any]] = {}
+        for item in items:
+            for entry in item["references"]["detail"]:
+                seen = affected.setdefault(
+                    entry["channel"], {"name": entry["name"], "where": set()}
+                )
+                seen["where"].add(entry["where"])
+
+        for number in sorted(affected):
+            name = affected[number]["name"]
+            if "channel" in affected[number]["where"]:
+                # Not "this channel will be affected". A customer needs to know
+                # what they will actually be looking at on the television
+                # afterwards, which is colour bars - see app.py's _show_no_signal.
+                said.append(
+                    f"Channel {number} ({name}) plays from this. Deleting it "
+                    f"leaves that channel with nothing at all: the television "
+                    f"will show colour bars and "
+                    f"\"CH {number:02d}  {name}  -  NO SIGNAL\" on channel "
+                    f"{number} until you point it at another folder or restore "
+                    f"this from the trash."
+                )
+            else:
+                said.append(
+                    f"A scheduled block on channel {number} ({name}) plays from "
+                    f"this. That part of the day will be NO SIGNAL until you "
+                    f"point it somewhere else or restore this from the trash."
+                )
+
+        busy = sum(item["uploads"] for item in items)
+        if busy:
+            said.append(
+                f"{busy} upload(s) are still arriving into this. They have to be "
+                f"cancelled before it can go."
+            )
+
+        free, total = space.get("free_bytes"), space.get("total_bytes")
+        if free is not None and total and free < total * LIBRARY_DISK_TIGHT:
+            said.append(
+                f"This disk is nearly full - {_mb(free)} left of {_mb(total)} - "
+                f"and deleting will not change that by one byte. "
+                f"{_mb(space['reclaimable_bytes'])} can be got back by emptying "
+                f"the trash."
+            )
+        return said
+
+    def _library_plan(config: Config, root: Path, paths: List[str]) -> Dict[str, Any]:
+        """The whole confirmation dialog, as one answer. See deletion_plan."""
+        uploads = _store_for(config)
+        items = [
+            library.deletion_plan(
+                root, path, allowed=config.video_extensions,
+                config=config, uploads=uploads,
+            )
+            for path in paths
+        ]
+        space = library.free_space(root, uploads=uploads)
+        channels: List[int] = []
+        dayparts: List[int] = []
+        for item in items:
+            for number in item["references"]["channels"]:
+                if number not in channels:
+                    channels.append(number)
+            for number in item["references"]["dayparts"]:
+                if number not in dayparts:
+                    dayparts.append(number)
+        return {
+            "ok": True,
+            "items": items,
+            "totals": {
+                "files": sum(item["files"] for item in items),
+                "folders": sum(item["folders"] for item in items),
+                "bytes": sum(item["bytes"] for item in items),
+            },
+            "channels": sorted(channels),
+            "dayparts": sorted(dayparts),
+            "uploads": sum(item["uploads"] for item in items),
+            # Both of these are the same fact said twice on purpose: the flag
+            # is for the page's logic, the sentence is for the person reading it.
+            "frees_space": False,
+            "note": items[0]["note"],
+            "warnings": _library_warnings(items, space),
+            "space": space,
+        }
+
+    @app.get("/api/library")
+    def api_library_browse():
+        config, root = _library()
+        return jsonify(library.browse(
+            root,
+            request.args.get("path", ""),
+            allowed=config.video_extensions,
+            page=request.args.get("page", 1),
+            per_page=request.args.get("per_page", library.DEFAULT_PAGE_SIZE),
+            sort=request.args.get("sort", "name"),
+            order=request.args.get("order", "asc"),
+        ))
+
+    @app.post("/api/library/plan")
+    def api_library_plan():
+        """What deleting this selection would cost. Changes nothing."""
+        config, root = _library()
+        return jsonify(_library_plan(config, root, _library_paths(_body())))
+
+    @app.post("/api/library/delete")
+    def api_library_delete():
+        _confirmed()
+        config, root = _library()
+        body = _body()
+        paths = _library_paths(body)
+        cancel = bool(body.get("cancel_uploads"))
+        uploads = _store_for(config)
+
+        # Before the first byte moves. A channel that can see into the trash
+        # would put every one of these files straight back on the air, and a
+        # customer would be left deleting the same episode every evening.
+        taught = _teach_channels_to_ignore_the_machinery(config, root)
+        if taught:
+            config = _need_config()
+
+        done: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        for path in paths:
+            try:
+                item = library.move_to_trash(
+                    root, path,
+                    allowed=config.video_extensions,
+                    uploads=uploads,
+                    cancel_uploads=cancel,
+                )
+            except (UnsafePath, library.LibraryError) as exc:
+                if getattr(exc, "catastrophic", False):  # pragma: no cover - not from here
+                    raise
+                # One bad name in a selection of forty must not lose the other
+                # thirty-nine, and it must not be silent either.
+                failed.append({
+                    "path": path,
+                    "error": str(exc),
+                    "status": _library_status(exc),
+                })
+                continue
+            done.append({
+                "name": item["name"], "relative": item["relative"],
+                "kind": item["kind"], "token": item["token"],
+                "bytes": item["bytes"], "files": item["files"],
+            })
+
+        # Nothing moved at all: answer with the refusal itself rather than a
+        # cheerful 200 carrying a failure list nobody reads.
+        if not done:
+            raise ApiError(failed[0]["error"], failed[0]["status"])
+
+        space = library.free_space(root, uploads=uploads)
+        return _saved(config, {
+            "deleted": done,
+            "failed": failed,
+            # Zero, said out loud, every time. This is the number people go
+            # looking for on the storage gauge and do not find.
+            "freed_bytes": 0,
+            "trash_bytes": space["trash_bytes"],
+            "trash_items": space["trash_items"],
+            "space": space,
+            "note": space["note"],
+            "channels_taught": taught,
+        })
+
+    @app.post("/api/library/rename")
+    def api_library_rename():
+        config, root = _library()
+        body = _body()
+        result = library.rename_folder(
+            store, root,
+            body.get("path", ""),
+            body.get("name", ""),
+            uploads=_store_for(config),
+            cancel_uploads=bool(body.get("cancel_uploads")),
+        )
+        # Re-read: the rename may have rewritten every channel path in the file,
+        # and the lineup this answers with has to be the one on the disk now.
+        return _saved(_need_config(), result)
+
+    @app.get("/api/library/space")
+    def api_library_space():
+        """The answer to "I deleted 40 GB and the disk is still full"."""
+        config, root = _library()
+        return jsonify(library.free_space(root, uploads=_store_for(config)))
+
+    @app.get("/api/library/trash")
+    def api_library_trash():
+        config, root = _library()
+        return jsonify({
+            "items": library.list_trash(root),
+            "usage": library.trash_usage(root),
+            "keep_days": library.DEFAULT_TRASH_DAYS,
+        })
+
+    @app.post("/api/library/trash/restore")
+    def api_library_restore():
+        config, root = _library()
+        body = _body()
+        token = body.get("token")
+        if not isinstance(token, str) or not token.strip():
+            raise ApiError("nothing was chosen to put back")
+        replace = bool(body.get("replace"))
+        if replace:
+            # Restoring over something moves that something to the trash. It is
+            # not lost, but it does leave the folder, so it is confirmed.
+            _confirmed()
+        result = library.restore(root, token.strip(), replace=replace)
+        space = library.free_space(root, uploads=_store_for(config))
+        return _saved(config, {**result, "space": space})
+
+    @app.delete("/api/library/trash")
+    def api_library_empty_trash():
+        """The only route on this box that destroys a video file for good."""
+        _confirmed()
+        config, root = _library()
+        token = request.args.get("token") or None
+        days = request.args.get("older_than_days")
+        older: Optional[float] = None
+        if days:
+            try:
+                older = float(days)
+            except (TypeError, ValueError):
+                raise ApiError("older_than_days is a number of days") from None
+        result = library.purge_trash(root, token=token, older_than_days=older)
+        space = library.free_space(root, uploads=_store_for(config))
+        log.info("emptied %d item(s) from the trash", result["items"])
+        return jsonify({
+            "ok": True,
+            "items": result["items"],
+            "bytes": result["bytes"],
+            "trash_bytes": space["trash_bytes"],
+            "trash_items": space["trash_items"],
+            "space": space,
+        })
+
     # -- settings -----------------------------------------------------------
     @app.get("/api/settings")
     def api_settings():
@@ -1312,6 +2031,110 @@ def create_app(config_path: Optional[str] = None):
     # ==================================================================
     # System: health, logs, service control, backup, the clock
     # ==================================================================
+    # -- can this box still do its job -------------------------------------
+    # One answer, kept for PRIVILEGE_CHECK_TTL. The lock is not for the dict:
+    # it is so that ten browsers landing on the System page at once cause one
+    # round of asking sudo rather than ten. The dashboard is threaded.
+    _privilege_lock = threading.Lock()
+    _privilege_seen: Dict[str, Any] = {"asked": None, "check": None}
+
+    def _privileges_remembered() -> Optional[servicectl.PrivilegeCheck]:
+        """The last answer, however old. Never asks. Never spawns anything."""
+        return _privilege_seen["check"]
+
+    def _privileges() -> Optional[servicectl.PrivilegeCheck]:
+        """What sudo will let this box do, asked at most once every TTL.
+
+        Returns ``None`` if the question could not be answered, which is not
+        the same as an answer of "broken" and is not shown to anybody: a check
+        this dashboard could not run is this dashboard's problem.
+        """
+        with _privilege_lock:
+            asked = _privilege_seen["asked"]
+            if asked is not None and (time.monotonic() - asked) < PRIVILEGE_CHECK_TTL:
+                return _privilege_seen["check"]
+            # Recorded before the answer, and whatever the answer turns out to
+            # be: a check that keeps failing must be rationed exactly as
+            # firmly as one that succeeds, or a box where sudo is missing
+            # entirely is one where this endpoint has no ceiling on it at all.
+            _privilege_seen["asked"] = time.monotonic()
+            try:
+                check = servicectl.check_privileges()
+            except AssertionError:
+                # The test suite's guard against a command that would touch
+                # the real machine. It stays loud rather than becoming a log
+                # line - see tests/conftest.py.
+                raise
+            except Exception:  # noqa: BLE001 - a page that loads beats a right answer
+                log.warning("could not check this box's permission", exc_info=True)
+                _privilege_seen["check"] = None
+                return None
+            _privilege_seen["check"] = check
+            if check.needs_repair:
+                # The only place the raw refusals are ever written down. A
+                # journal is read by somebody who can act on paths and sudo's
+                # own words; a television owner is not.
+                log.warning(
+                    "privileges %s: %s (%s)",
+                    check.state, check.detail, "; ".join(check.refused),
+                )
+            return check
+
+    @app.get("/api/system/privileges")
+    def api_system_privileges():
+        """Does the permission on this box still cover what this code runs?
+
+        Behind a page load, deliberately, and debounced on top of that: it is
+        one short-lived sudo process per privileged command, on a box that is
+        playing video, and there is no login on this page to stop somebody
+        asking for it over and over.
+        """
+        return jsonify(privilege_answer(_privileges()))
+
+    @app.post("/api/system/privileges/repair")
+    def api_system_privileges_repair():
+        """Put the permission back - as far as an unprivileged page ever can.
+
+        **Nothing in the request is read.** Not the body, not the query
+        string, not a header. This route re-installs the rule servicectl
+        generates for the account this process is already running as, and
+        there is no parameter that can influence which account that is, which
+        commands the rule grants or which file it is written to. That is the
+        whole of the safety argument for a button that anybody on the home
+        network can press: the request chooses nothing, so there is nothing in
+        it worth sending. A username from a request reaching sudoers_rule()
+        would be a rule granting root to a name the attacker picked.
+
+        In the dashboard this always answers "changed nothing", because the
+        dashboard is not root and no sudoers rule lets it write sudoers rules
+        - one that did would hand this box to anyone who can reach this page.
+        What it hands back instead is the exact command to type on the box.
+        """
+        try:
+            result = servicectl.repair()
+        except AssertionError:
+            raise
+        except Exception:  # noqa: BLE001 - see servicectl: this should not happen
+            log.warning("the permission repair fell over", exc_info=True)
+            raise ApiError(
+                "This box could not put its permission back just now, and "
+                "nothing has been changed. Trying again is safe.", 503,
+            ) from None
+
+        if result.applied:
+            # Root ran this - the installer, or a person. What was true a
+            # moment ago no longer is, so the next look asks again.
+            with _privilege_lock:
+                _privilege_seen.update({"asked": None, "check": None})
+        log.info("permission repair from the dashboard: applied=%s (%s)",
+                 result.applied, result.detail)
+        return jsonify({
+            "applied": result.applied,
+            "message": result.message,
+            "command": result.command,
+            "user": servicectl.current_user(),
+        })
+
     def _system_report() -> Dict[str, Any]:
         config = _config()
         report = sysinfo.report(media_root=config.media_root if config else None)
@@ -1325,7 +2148,35 @@ def create_app(config_path: Optional[str] = None):
         report["tv_uptime_seconds"] = _as_number(status.get("uptime_seconds"))
         report["channel_count"] = _as_int(status.get("channel_count"))
         report["config_path"] = str(store.path)
+        # The last answer about this box's permission, if there is one. The
+        # word only, and never a fresh round of asking: this report is behind
+        # a GET on a page with no login, and the check is twenty-one processes.
+        remembered = _privileges_remembered()
+        report["privileges"] = remembered.state if remembered else ""
+        # The trash sits on the media disk and is counted in "used", so
+        # without this line it is mystery usage: gigabytes gone with nothing
+        # on any screen to explain them. It goes in the storage block on the
+        # System page and in the support bundle, next to the free-space figure
+        # it is the explanation for.
+        report["trash"] = _trash_summary(config)
         return report
+
+    def _trash_summary(config: Optional[Config]) -> Dict[str, Any]:
+        """What the trash is holding, or zeroes. Never raises: this is a GET."""
+        empty = {"items": 0, "bytes": 0, "keep_days": library.DEFAULT_TRASH_DAYS}
+        if config is None or config.media_root is None:
+            return empty
+        try:
+            usage = library.trash_usage(config.media_root)
+        except Exception:  # noqa: BLE001 - a health page must still render
+            log.debug("could not measure the trash", exc_info=True)
+            return empty
+        return {
+            "items": usage["items"],
+            "bytes": usage["bytes"],
+            "oldest": usage["oldest"],
+            "keep_days": library.DEFAULT_TRASH_DAYS,
+        }
 
     @app.get("/api/system")
     def api_system():
@@ -1345,6 +2196,10 @@ def create_app(config_path: Optional[str] = None):
             )
         except ValueError as exc:
             raise ApiError(str(exc)) from None
+        # This panel is on the same tab as the permission banner, and it is
+        # read by the owner of the box, not by us. Held to exactly the same
+        # rule as the bundle, through exactly the same function.
+        page["entries"] = _log_entries_for_reading(page.get("entries"))
         return jsonify(page)
 
     @app.get("/api/system/support")
@@ -1367,7 +2222,12 @@ def create_app(config_path: Optional[str] = None):
         try:
             did = servicectl.run(action)
         except servicectl.ServiceError as exc:
-            raise ApiError(str(exc), 503) from None
+            # .plain, never str(exc). str(exc) is what the command said, which
+            # for a refused button is "sudo: a password is required" - on a box
+            # whose owner has no password to type, no keyboard to type it on
+            # and no idea what sudo is. The machine's own words go to the log.
+            log.warning("%s failed: %s", action, exc)
+            raise ApiError(exc.plain, 503) from None
         return jsonify({"ok": True, "action": action, "message": f"Asked to {did}."})
 
     # -- the config file itself ---------------------------------------------
@@ -1501,7 +2361,7 @@ def create_app(config_path: Optional[str] = None):
             # media_root resolve exactly as they will on the next start.
             checked = load_config(staged)
             _validated_config_paths(checked)
-            _validated_config_commands(checked)
+            _validated_config_refusals(checked)
             return checked
         except ConfigError as exc:
             raise ApiError(f"that config will not load: {exc}") from None
@@ -1513,20 +2373,34 @@ def create_app(config_path: Optional[str] = None):
             except OSError:  # pragma: no cover
                 pass
 
-    def _validated_config_commands(config: Config) -> None:
-        """Nothing that arrives here may name a command for the box to run.
+    def _validated_config_refusals(config: Config) -> None:
+        """Nothing the loader threw away may be saved to the disk from here.
 
-        ``power_off_command`` is the one config value that ends up as the argv
-        of a ``subprocess.Popen`` on the television, and it runs the next time
-        anybody shuts the box down - this dashboard's own button, the sleep
-        timer, or volume-down past zero. This page has no password, so a
-        document naming anything other than a plain shutdown is refused
-        outright rather than quietly corrected: the loader has already thrown
-        the value away (see config.py), and a customer who is told their file
-        was refused is better off than one running settings they never chose.
+        Two kinds of value in config.yaml can hurt somebody, and the loader
+        knows about both (see the long note at the top of config.py):
+
+        * one that becomes the argv of a ``subprocess.Popen`` on the
+          television - ``power_off_command``, which runs the next time anybody
+          shuts the box down, and ``input.cec_binary``, which runs at every
+          start-up;
+        * one that becomes a folder this box reads, writes or deletes inside -
+          ``media_root``, a channel's ``path``, a daypart's ``path``,
+          ``bumpers``, ``assets_dir``, ``input.web_socket`` - plus
+          ``video_extensions``, which decides what an upload is allowed to be.
+
+        The loader has already dropped whichever of those it would not accept,
+        so the television keeps running either way. This page has no password,
+        so it refuses to SAVE such a document rather than quietly correcting
+        it: a customer told their file was refused is better off than one
+        running settings they never chose.
         """
-        if config.power_off_command_refused:
-            raise ApiError(f"that config will not load: {config.power_off_command_refused}")
+        if config.refusals:
+            shown = "; ".join(config.refusals[:3])
+            more = (
+                f" (and {len(config.refusals) - 3} more)"
+                if len(config.refusals) > 3 else ""
+            )
+            raise ApiError(f"that config will not load: {shown}{more}")
 
     def _validated_config_paths(config: Config) -> None:
         """Every folder it names has to be there.
@@ -1565,8 +2439,80 @@ def create_app(config_path: Optional[str] = None):
         try:
             servicectl.set_timezone(wanted, allowed=sysinfo.timezones())
         except servicectl.ServiceError as exc:
-            raise ApiError(str(exc)) from None
+            # Same rule as the Power buttons: the plain sentence to the page,
+            # the machine's own words to the journal.
+            log.warning("could not set the timezone: %s", exc)
+            raise ApiError(exc.plain) from None
+        # Written down only once the change actually happened, and this is the
+        # whole difference between "nobody has ever told this box where it is"
+        # and "somebody told it, and they meant it". Without it, the next boot
+        # onto a new connection asks a lookup service where the box is and
+        # quietly moves the zone its owner just picked.
+        _remember_chosen_timezone(wanted)
         return jsonify({"ok": True, "timezone": wanted, **sysinfo.timezone()})
+
+    def _time_state_path() -> Path:
+        return store.path.with_name(TIME_STATE_NAME)
+
+    def _remember_chosen_timezone(zone: str) -> None:
+        """Never raises: a record that could not be written is not a failed save."""
+        try:
+            timekeeping.record_manual_timezone(_time_state_path(), zone)
+        except AssertionError:
+            raise
+        except Exception:  # noqa: BLE001 - the zone is already set on the box
+            log.warning("could not write down that %s was chosen by hand", zone,
+                        exc_info=True)
+
+    @app.get("/api/system/clock")
+    def api_system_clock():
+        """Is this clock right, is anything keeping it right, and where is it?
+
+        Everything here is ready to render: ``alarm`` is true only when the
+        clock is wrong AND nothing is going to correct it by itself, which is
+        the one state somebody has to act on; ``headline`` and ``detail`` name
+        the coin cell and say what a wrong clock does to dayparting.
+
+        Behind a page load, never a timer. It shells out to ``timedatectl``.
+        """
+        config = _config()
+        detect = True if config is None else bool(config.time.detect_timezone)
+        return jsonify(timekeeping.report(
+            state_path=_time_state_path(), detect_enabled=detect,
+        ))
+
+    @app.post("/api/system/clock/detection")
+    def api_system_clock_detection():
+        """The off switch for the one outbound call this product makes itself.
+
+        No reload is sent: the television does not read this setting - the
+        dashboard does, once, when it starts - so there is nothing for the
+        player to apply and nothing to interrupt for it.
+        """
+        wanted = _body().get("enabled")
+        if not isinstance(wanted, bool):
+            raise ApiError("enabled is true or false")
+
+        def mutate(data: Dict[str, Any]) -> None:
+            existing = data.get("time")
+            merged = dict(existing) if isinstance(existing, dict) else {}
+            merged["detect_timezone"] = wanted
+            data["time"] = merged
+
+        store.update(mutate)
+        log.info("working the timezone out from this box's location is now %s",
+                 "on" if wanted else "off")
+        return jsonify({
+            "ok": True,
+            "detection": {
+                "enabled": wanted,
+                "what_is_sent": timekeeping.WHAT_IS_SENT,
+            },
+            "note": ("This box will work its timezone out from its internet "
+                     "address the next time it starts on a new connection."
+                     if wanted else
+                     "This box will not ask anybody where it is."),
+        })
 
     # ==================================================================
     # Updates
@@ -1635,7 +2581,7 @@ def create_app(config_path: Optional[str] = None):
             # and nothing will be until somebody undoes overlayroot.
             status = 409 if state.get("phase") == "failed" and "root" in str(exc) else 500
             return jsonify({
-                "ok": False, "error": str(exc), "progress": state,
+                "ok": False, "error": _for_a_customer(exc), "progress": state,
             }), status
         return jsonify({"ok": True, "progress": state})
 
@@ -1646,7 +2592,7 @@ def create_app(config_path: Optional[str] = None):
         try:
             state = updater.rollback_now()
         except UpdateError as exc:
-            raise ApiError(str(exc)) from None
+            raise ApiError(_for_a_customer(exc)) from None
         return jsonify({"ok": True, "progress": state})
 
     # ==================================================================
@@ -1667,11 +2613,22 @@ def create_app(config_path: Optional[str] = None):
             "now": {"minute": now, **schedule.preview_at(parts, now)},
             # Right here rather than buried in a system page: a wrong clock
             # makes dayparting behave in a way that looks exactly like a bug.
+            #
+            # Two faults, not one, and they need different things doing. A
+            # clock nothing is correcting will DRIFT - annoying, gradual, and
+            # nothing is wrong yet. A clock reading a date from before this
+            # software existed is ALREADY playing the wrong thing at every
+            # hour of the day, and it means the coin cell on the motherboard
+            # is flat. `plausible` is what tells them apart, and
+            # `sync_summary` is the difference between "four minutes ago" and
+            # "never", which is what sends somebody to buy the part.
             "clock": {
                 "local_time": clock.get("local_time"),
                 "timezone": clock.get("timezone"),
                 "synchronised": clock.get("synchronised"),
                 "warning": clock.get("warning"),
+                "plausible": clock.get("plausible"),
+                "sync_summary": clock.get("sync_summary"),
             },
         })
 
@@ -1826,12 +2783,17 @@ def create_app(config_path: Optional[str] = None):
         return jsonify({
             "splash": branding.describe(config.boot_splash, assets),
             "max_seconds": branding.MAX_SPLASH_SECONDS,
+            # Every value the shader is generated from, so the page can show
+            # what the picture is actually doing. All five are writable by the
+            # POST below - a value that can be read and never changed is a
+            # control nobody can find and a question nobody can answer.
             "crt": {
                 "enabled": config.crt.enabled,
                 "curvature": config.crt.curvature,
                 "scanlines": config.crt.scanlines,
                 "scanline_intensity": config.crt.scanline_intensity,
                 "vignette": config.crt.vignette,
+                "corner_radius": config.crt.corner_radius,
             },
             "osd": {
                 "channel_bug_seconds": config.channel_bug_seconds,
@@ -1915,8 +2877,8 @@ def create_app(config_path: Optional[str] = None):
     @app.post("/api/branding/appearance")
     def api_branding_appearance():
         body = _body()
-        allowed = {"crt_enabled", "curvature", "scanlines", "scanline_intensity",
-                   "channel_bug_seconds", "guide_seconds"}
+        allowed = {key for key, _, _, _ in _CRT_SETTINGS} | {
+            "channel_bug_seconds", "guide_seconds"}
         unknown = sorted(set(body) - allowed)
         if unknown:
             raise ApiError(f"{', '.join(unknown)} cannot be set here")
@@ -1929,20 +2891,11 @@ def create_app(config_path: Optional[str] = None):
                 raise ApiError(f"{key} must be between {low} and {high}")
             return float(raw)
 
-        crt: Dict[str, Any] = {}
+        # The same table, and so the same bounds, as the live preview: what
+        # the customer has been watching on the television is what saving it
+        # writes down.
+        crt: Dict[str, Any] = _crt_from_body(body)
         top: Dict[str, Any] = {}
-        if "crt_enabled" in body:
-            if not isinstance(body["crt_enabled"], bool):
-                raise ApiError("crt_enabled is true or false")
-            crt["enabled"] = body["crt_enabled"]
-        if "curvature" in body:
-            crt["curvature"] = number("curvature", 0.0, 0.5)
-        if "scanlines" in body:
-            if not isinstance(body["scanlines"], bool):
-                raise ApiError("scanlines is true or false")
-            crt["scanlines"] = body["scanlines"]
-        if "scanline_intensity" in body:
-            crt["scanline_intensity"] = number("scanline_intensity", 0.0, 1.0)
         if "channel_bug_seconds" in body:
             top["channel_bug_seconds"] = number("channel_bug_seconds", 0.0, 60.0)
         if "guide_seconds" in body:
@@ -1957,13 +2910,17 @@ def create_app(config_path: Optional[str] = None):
                 data["crt"] = merged
 
         saved = store.update(mutate)
-        return _saved(saved, {
-            "restart_required": ["crt"] if crt else [],
-            "note": (
-                "The CRT picture effect is set up when the television starts, so "
-                "a change to it needs a restart." if crt else ""
-            ),
-        })
+        # Nothing here needs a restart any more. `_saved` asks the television
+        # to reload, and its reload path hands the new settings to
+        # `player.set_crt`, which puts a freshly compiled shader on the frame
+        # that is already on screen - no loadfile, no seek, no black moment.
+        # So by the time this reply reaches the browser the picture has
+        # already changed, and the old note telling the customer to restart
+        # was being toasted at the exact moment they could see that it had.
+        return _saved(
+            saved, {"restart_required": []},
+            applied_note=("Saved - look at the television." if crt else "Saved."),
+        )
 
     @app.post("/api/branding/preview")
     def api_branding_preview():
@@ -1974,6 +2931,54 @@ def create_app(config_path: Optional[str] = None):
         viewer sees.
         """
         return _dispatch("info")
+
+    @app.post("/api/branding/preview/picture")
+    def api_branding_preview_picture():
+        """Show unsaved picture settings on the television that is playing.
+
+        This is somebody dragging the curvature slider with the television in
+        front of them. Curvature is a taste setting with no correct value, so
+        that is the only way anybody sets it sensibly, and the alternative -
+        save, look up, change it, save again - writes six versions of a
+        setting to config.yaml to find one.
+
+        NOTHING HERE IS SAVED. The line goes to the running player over the
+        control socket and no further; only SAVE PICTURE SETTINGS writes to
+        config.yaml. A browser that closes mid-drag says nothing at all, so
+        the box gives a preview up by itself after
+        :data:`retrobox.app.TVApp.CRT_PREVIEW_HOLD_SECONDS` of silence and
+        puts the saved picture back - which is what makes it safe to drag a
+        slider and walk away.
+        """
+        body = _body()
+        unknown = sorted(set(body) - {key for key, _, _, _ in _CRT_SETTINGS})
+        if unknown:
+            raise ApiError(f"{', '.join(unknown)} cannot be previewed")
+        settings = _crt_from_body(body)
+        if not settings:
+            raise ApiError("there is nothing to preview")
+        # "on"/"off" are two of the words the socket's own closed list takes,
+        # and :g is the shortest form of a float that reads back as the same
+        # number - str() of 0.1 + 0.2 would put "0.30000000000000004" on a
+        # line no slider ever meant.
+        def word(value: Any) -> str:
+            if isinstance(value, bool):
+                return "on" if value else "off"
+            return f"{value:g}"
+
+        said = " ".join(f"{name}={word(value)}" for name, value in settings.items())
+        return _dispatch(f"crt_preview {said}")
+
+    @app.post("/api/branding/preview/cancel")
+    def api_branding_preview_cancel():
+        """Throw a preview away and put the last SAVED picture back.
+
+        Both the Cancel button and what the page sends on its way out, so
+        somebody who dragged a slider and changed their mind does not have to
+        save to undo it. Safe to call when nothing is being previewed: the
+        television treats that as nothing to do.
+        """
+        return _dispatch("crt_cancel")
 
     # ==================================================================
     # Network - the one thing here that can cut you off from the box
@@ -2097,7 +3102,15 @@ def create_app(config_path: Optional[str] = None):
         except Exception:  # noqa: BLE001
             raise ApiError("could not change the hostname", 503) from None
         if code != 0:
-            raise ApiError(f"could not change the hostname: {output[:200]}", 503)
+            # Whatever the command said, in words for the person in front of
+            # the television. A refusal here is the stale-sudoers fault and
+            # comes back as the sentence that says what to do about it; a real
+            # failure ("Read-only file system") keeps its own words, minus
+            # anything sudo wrote about itself.
+            log.warning("could not change the hostname: %s", output[:200])
+            raise ApiError(
+                servicectl.explain_failure(output, action="network"), 503
+            )
         return jsonify({
             "ok": True, "hostname": name,
             "message": (
@@ -2138,6 +3151,62 @@ def create_app(config_path: Optional[str] = None):
     except Exception:  # noqa: BLE001 - never let housekeeping stop the server
         log.debug("could not sweep abandoned uploads at start-up", exc_info=True)
 
+    # And whether this box can still do the privileged half of its job. A box
+    # nobody ever opens the dashboard on gets the fault into its journal this
+    # way, and a box somebody does open has the answer waiting.
+    #
+    # On its own thread, and never joined: asking is up to twenty-one
+    # short-lived processes, and a wedged sudo would otherwise hold the first
+    # page open for as long as they all take to give up. A box with a broken
+    # permission file is exactly the box that most needs its dashboard to come
+    # up, so nothing here is allowed to be in the way of that.
+    app.privilege_startup = None
+    if os.environ.get(STARTED_BY_SYSTEMD):
+        def _check_at_startup() -> None:
+            try:
+                _privileges()
+            except Exception:  # noqa: BLE001 - a thread dying loudly helps nobody
+                log.warning("the start-up permission check fell over", exc_info=True)
+
+        app.privilege_startup = threading.Thread(
+            target=_check_at_startup, name="privilege-check", daemon=True
+        )
+        app.privilege_startup.start()
+
+    # And the clock. Two jobs, both of which can only be done at start-up.
+    #
+    # The first is writing down whether this box woke up believing it was
+    # 2011, because the fix erases the evidence: a flat coin cell on a box
+    # with internet is wrong for forty seconds and then perfectly normal, and
+    # by the time anybody opens the dashboard there is nothing left to see.
+    #
+    # The second is working the timezone out from the box's address, once, on
+    # a box nobody has ever told where it is - an installer's Etc/UTC makes
+    # every daypart fire at the wrong hour, and nothing else on this box will
+    # ever notice.
+    #
+    # Behind the same INVOCATION_ID gate as the check above, and for a
+    # stronger reason: detection is an outbound request to a third party.
+    # A checkout, a laptop, or this test suite is not a box that has booted,
+    # and none of them should be phoning anybody.
+    #
+    # `timekeeping.start` returns immediately and its thread is a daemon.
+    # Nothing joins it: a lookup that never answers must not be able to hold
+    # up a page, and a box whose time record is corrupt still gets a working
+    # dashboard.
+    app.timekeeping_startup = None
+    if os.environ.get(STARTED_BY_SYSTEMD):
+        try:
+            app.timekeeping_startup = timekeeping.start(
+                state_path=store.path.with_name(TIME_STATE_NAME),
+                config=_config(),
+            )
+        except AssertionError:
+            raise
+        except Exception:  # noqa: BLE001 - the dashboard outranks the clock
+            log.warning("could not look at this box's clock at start-up",
+                        exc_info=True)
+
     return app
 
 
@@ -2155,77 +3224,7 @@ VIEWER_PAGE = """<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>Retro Box</title>
-<style>
-  :root {
-    --green:""" + GREEN + """; --dim:""" + DIM + """;
-    --bg:#05080a; --line:rgba(77,255,90,.18); --fill:rgba(77,255,90,.04);
-    --red:#ff6b5a;
-    --mono:"VT323",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
-  }
-  * { box-sizing:border-box; }
-  [hidden] { display:none !important; }
-  html { -webkit-text-size-adjust:100%; }
-  body { margin:0; padding:1.2rem .9rem 3rem; background:var(--bg); color:var(--green);
-         font-family:var(--mono); font-size:19px; line-height:1.5;
-         text-shadow:0 0 6px rgba(77,255,90,.4); }
-  body::after { content:""; position:fixed; inset:0; pointer-events:none; z-index:50;
-    background:repeating-linear-gradient(0deg,rgba(0,0,0,.22) 0 1px,transparent 1px 3px); }
-  @media (prefers-contrast: more) { body::after { display:none; } }
-  .wrap { max-width:44rem; margin:0 auto; }
-
-  .mark { font-size:.7rem; letter-spacing:.42em; opacity:.5; margin:0 0 .1rem; }
-  h1 { font-size:1.5rem; margin:0 0 1rem; letter-spacing:.08em; font-weight:normal; }
-
-  /* The picture goes here. Until there is a stream to put in it this stays
-     empty and takes no space; a <video> dropped straight in needs no other
-     change to this page. */
-  #screen:empty { display:none; }
-  #screen { margin:0 0 1.1rem; border:1px solid var(--line); border-radius:3px;
-    overflow:hidden; background:#000; aspect-ratio:4/3; }
-  #screen video, #screen img { width:100%; height:100%; object-fit:contain;
-    display:block; }
-
-  .panel { border:1px solid var(--line); border-radius:3px; padding:1rem;
-           margin-bottom:1rem; background:var(--fill); }
-  h2 { font-size:.72rem; text-transform:uppercase; letter-spacing:.2em; opacity:.55;
-       margin:0 0 .7rem; font-weight:normal; display:flex; gap:.6rem; align-items:center; }
-  h2::after { content:""; flex:1; height:1px; background:var(--line); }
-
-  .ch { font-size:2.6rem; letter-spacing:.04em; margin:0; line-height:1.1; }
-  .show { font-size:1.15rem; margin:.35rem 0 0; opacity:.9; }
-  .meta { opacity:.55; font-size:.85rem; margin:.2rem 0 0; }
-
-  .meter { height:.7rem; border:1px solid var(--line); border-radius:1px; margin-top:.9rem;
-    background:repeating-linear-gradient(90deg,var(--dim) 0 6px,transparent 6px 9px); }
-  .meter i { display:block; height:100%; background:var(--green);
-    box-shadow:0 0 8px rgba(77,255,90,.6);
-    -webkit-mask:repeating-linear-gradient(90deg,#000 0 6px,transparent 6px 9px);
-    mask:repeating-linear-gradient(90deg,#000 0 6px,transparent 6px 9px); }
-  .times { display:flex; justify-content:space-between; font-size:.8rem;
-    opacity:.6; margin-top:.35rem; font-variant-numeric:tabular-nums; }
-
-  .row { display:flex; gap:.7rem; align-items:baseline; padding:.4rem .1rem;
-    border-bottom:1px solid rgba(77,255,90,.12); }
-  .row:last-child { border-bottom:0; }
-  .row.on { background:rgba(77,255,90,.14); }
-  .led { font-size:1rem; border:1px solid var(--line); border-radius:2px;
-    padding:.02rem .45rem; background:rgba(77,255,90,.07); min-width:3rem;
-    text-align:center; flex:none; }
-  .grow { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
-    white-space:nowrap; }
-  .tiny { font-size:.75rem; opacity:.5; flex:none; }
-  .off { color:var(--red); opacity:.85; }
-  .empty { opacity:.45; font-size:.85rem; }
-
-  .foot { display:flex; justify-content:space-between; align-items:center;
-    margin-top:1.2rem; font-size:.8rem; }
-  a { color:var(--green); text-decoration:none; border:1px solid var(--line);
-      border-radius:2px; padding:.6rem 1rem; letter-spacing:.12em;
-      display:inline-block; min-height:2.8rem; }
-  a:hover, a:focus-visible { background:rgba(77,255,90,.16); outline:none; }
-  a:focus-visible { outline:2px solid var(--green); outline-offset:1px; }
-  .dim { opacity:.45; letter-spacing:.06em; }
-</style></head><body><div class="wrap">
+<style>""" + webstyle.VIEWER_CSS + """</style></head><body><div class="wrap">
 
   <p class="mark">JV PROJECTS</p>
   <h1>RETRO BOX</h1>
@@ -2365,206 +3364,7 @@ PAGE = """<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>Retro Box &middot; Manage</title>
-<style>
-  :root {
-    --green:""" + GREEN + """; --dim:""" + DIM + """;
-    --bg:#05080a; --line:rgba(77,255,90,.18); --fill:rgba(77,255,90,.04);
-    --red:#ff6b5a; --amber:#ffc14d;
-    --mono:"VT323",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
-  }
-  * { box-sizing:border-box; }
-  /* Every display: rule below would otherwise beat the browser's own
-     [hidden] { display:none }, leaving hidden panels on screen. */
-  [hidden] { display:none !important; }
-  html { -webkit-text-size-adjust:100%; }
-  body { margin:0; padding:1.2rem .9rem 4rem; background:var(--bg); color:var(--green);
-         font-family:var(--mono); font-size:19px; line-height:1.5;
-         text-shadow:0 0 6px rgba(77,255,90,.4); }
-  /* The scanlines the on-screen display has, at a strength you can read through. */
-  body::after { content:""; position:fixed; inset:0; pointer-events:none; z-index:50;
-    background:repeating-linear-gradient(0deg,rgba(0,0,0,.22) 0 1px,transparent 1px 3px); }
-  @media (prefers-contrast: more) { body::after { display:none; } }
-  .wrap { max-width:44rem; margin:0 auto; }
-
-  /* -- masthead -------------------------------------------------------- */
-  .mark { font-size:.7rem; letter-spacing:.42em; opacity:.5; margin:0 0 .1rem; }
-  h1 { font-size:2.1rem; margin:0; letter-spacing:.08em; font-weight:normal; }
-  .sub { opacity:.6; margin:.1rem 0 1.1rem; font-size:.9rem; }
-  .sub.offline { color:var(--red); opacity:1; text-shadow:0 0 6px rgba(255,107,90,.4); }
-
-  /* -- tabs, as the service menu's top row ------------------------------ */
-  nav { display:flex; gap:.4rem; margin-bottom:1.1rem; }
-  nav button { flex:1; min-height:3rem; border:1px solid var(--line); background:transparent;
-    color:var(--green); font:inherit; font-size:.85rem; letter-spacing:.16em;
-    text-shadow:inherit; border-radius:2px; cursor:pointer; }
-  nav button[aria-selected="true"] { background:rgba(77,255,90,.16); border-color:var(--green); }
-
-  /* -- panels ----------------------------------------------------------- */
-  .panel { border:1px solid var(--line); border-radius:3px; padding:.9rem;
-           margin-bottom:1rem; background:var(--fill); }
-  h2 { font-size:.72rem; text-transform:uppercase; letter-spacing:.2em; opacity:.55;
-       margin:0 0 .7rem; font-weight:normal; display:flex; gap:.6rem; align-items:center; }
-  h2::after { content:""; flex:1; height:1px; background:var(--line); }
-  .now { font-size:1.55rem; margin:0 0 .2rem; }
-  .meta { opacity:.6; font-size:.85rem; margin:0; }
-
-  /* -- the LED channel number, straight off the front panel -------------- */
-  .led { font-size:1.15rem; letter-spacing:.06em; color:var(--green);
-    border:1px solid var(--line); border-radius:2px; padding:.05rem .45rem;
-    background:rgba(77,255,90,.07); min-width:3.1rem; text-align:center; flex:none; }
-
-  /* -- rows ------------------------------------------------------------- */
-  .row { display:flex; gap:.7rem; align-items:center; width:100%; min-height:3.1rem;
-    padding:.35rem .2rem; border:0; border-bottom:1px solid rgba(77,255,90,.12);
-    background:transparent; color:inherit; font:inherit; text-shadow:inherit;
-    text-align:left; cursor:pointer; }
-  .row:last-child { border-bottom:0; }
-  .row:hover, .row:focus-visible { background:rgba(77,255,90,.12); outline:none; }
-  .row.on { background:rgba(77,255,90,.2); }
-  .grow { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .tiny { font-size:.75rem; opacity:.5; }
-
-  /* -- controls --------------------------------------------------------- */
-  button, select, input { font:inherit; color:var(--green); background:transparent;
-    border:1px solid var(--line); border-radius:2px; text-shadow:inherit; }
-  button { min-height:3rem; padding:0 .9rem; cursor:pointer; letter-spacing:.08em; }
-  button:hover, button:focus-visible { background:rgba(77,255,90,.16); outline:none; }
-  button:focus-visible, .row:focus-visible { outline:2px solid var(--green); outline-offset:1px; }
-  button[disabled] { opacity:.35; cursor:not-allowed; }
-  .bar { display:flex; gap:.45rem; flex-wrap:wrap; }
-  .bar button { flex:1 1 auto; min-width:5.2rem; }
-  .ghost { min-height:2.4rem; font-size:.75rem; letter-spacing:.14em; padding:0 .7rem; }
-  .danger { border-color:var(--red); color:var(--red); text-shadow:0 0 6px rgba(255,107,90,.35); }
-  .danger:hover, .danger:focus-visible { background:rgba(255,107,90,.14); }
-  .danger.armed { background:rgba(255,107,90,.22); }
-  input, select { width:100%; min-height:3rem; padding:0 .6rem; }
-  input::placeholder { color:var(--green); opacity:.3; }
-  label { display:block; font-size:.72rem; letter-spacing:.16em; text-transform:uppercase;
-    opacity:.55; margin:.8rem 0 .25rem; }
-  .field { margin-bottom:.2rem; }
-
-  /* -- the editor ------------------------------------------------------- */
-  .edit { border:1px solid var(--line); border-radius:2px; padding:.75rem;
-    margin:.4rem 0 .8rem; background:rgba(77,255,90,.03); }
-  .split { display:flex; gap:.5rem; }
-  .split .field { flex:1; }
-  .split .field.narrow { flex:0 0 6.5rem; }
-
-  /* -- upload meter, drawn like the volume bars on the TV ---------------- */
-  .meter { height:.85rem; border:1px solid var(--line); border-radius:1px; flex:1;
-    background:repeating-linear-gradient(90deg,var(--dim) 0 6px,transparent 6px 9px); }
-  .meter i { display:block; height:100%; background:var(--green);
-    box-shadow:0 0 8px rgba(77,255,90,.6);
-    -webkit-mask:repeating-linear-gradient(90deg,#000 0 6px,transparent 6px 9px);
-    mask:repeating-linear-gradient(90deg,#000 0 6px,transparent 6px 9px); }
-  .progress { display:flex; gap:.6rem; align-items:center; margin-top:.5rem; }
-  .progress span { font-variant-numeric:tabular-nums; min-width:3.4rem; text-align:right; }
-
-  .note { font-size:.8rem; opacity:.6; margin:.5rem 0 0; }
-  .note.warn { color:var(--amber); opacity:.9; }
-  .note.bad { color:var(--red); opacity:.95; }
-  .empty { opacity:.45; font-size:.85rem; padding:.5rem .2rem; }
-
-  /* -- the drop zone ---------------------------------------------------- */
-  .drop { border:1px dashed var(--line); border-radius:3px; padding:1.4rem 1rem;
-    text-align:center; transition:background .15s, border-color .15s; }
-  .drop.over { border-color:var(--green); border-style:solid;
-    background:rgba(77,255,90,.12); }
-  .dropline { margin:0 0 .3rem; letter-spacing:.12em; font-size:.95rem; }
-  @media (prefers-reduced-motion: reduce) { .drop { transition:none; } }
-
-  /* -- the upload queue -------------------------------------------------- */
-  .job { display:flex; gap:.6rem; align-items:center; padding:.4rem .2rem;
-    border-bottom:1px solid rgba(77,255,90,.12); }
-  .job:last-child { border-bottom:0; }
-  .job .grow { font-size:.9rem; }
-  .state { font-size:.7rem; letter-spacing:.12em; text-transform:uppercase;
-    opacity:.6; min-width:5.4rem; text-align:right; flex:none; }
-  .state.done { color:var(--green); opacity:1; }
-  .state.failed { color:var(--red); opacity:1; }
-  .state.warn { color:var(--amber); opacity:1; }
-  .totals { display:flex; justify-content:space-between; font-size:.8rem;
-    opacity:.65; margin-top:.4rem; }
-
-  /* -- system ------------------------------------------------------------ */
-  .fact { display:flex; gap:.7rem; align-items:baseline; padding:.32rem .1rem;
-    border-bottom:1px solid rgba(77,255,90,.1); font-size:.92rem; }
-  .fact:last-child { border-bottom:0; }
-  .fact .key { opacity:.5; min-width:9.5rem; flex:none; font-size:.78rem;
-    text-transform:uppercase; letter-spacing:.1em; }
-  .fact .val { flex:1; min-width:0; word-break:break-word; }
-  .fact .val.bad { color:var(--red); }
-  .fact .val.warn { color:var(--amber); }
-  .raw { background:#040a05; border:1px solid var(--line); border-radius:2px;
-    padding:.7rem; font-size:.75rem; line-height:1.45; max-height:26rem;
-    overflow:auto; white-space:pre-wrap; word-break:break-word; margin:.7rem 0 0; }
-  .press { display:flex; gap:.7rem; align-items:baseline; padding:.3rem .1rem;
-    border-bottom:1px solid rgba(77,255,90,.1); }
-  .press:last-child { border-bottom:0; }
-  .press .who { font-size:.7rem; opacity:.5; min-width:5.5rem; flex:none;
-    text-transform:uppercase; letter-spacing:.1em; }
-  .press .what { flex:1; letter-spacing:.06em; }
-  .press.fresh { background:rgba(77,255,90,.22); }
-
-  /* -- updates ----------------------------------------------------------- */
-  .notes { border:1px solid var(--line); border-radius:2px; padding:.2rem .9rem;
-    margin:.6rem 0; background:rgba(77,255,90,.03); max-height:22rem;
-    overflow:auto; }
-  .notes h3, .notes h4, .notes h5, .notes h6 { font-size:.8rem; margin:.9rem 0 .3rem;
-    letter-spacing:.12em; text-transform:uppercase; opacity:.65; font-weight:normal; }
-  .notes ul { margin:.2rem 0 .7rem; padding-left:1.1rem; }
-  .notes li { margin:.15rem 0; font-size:.9rem; }
-  .notes p { font-size:.9rem; margin:.4rem 0; }
-  .notes code { background:rgba(77,255,90,.12); padding:0 .25rem; border-radius:2px; }
-  .rel { border-bottom:1px solid var(--line); }
-  .rel:last-child { border-bottom:0; }
-  .rel h3:first-child { margin-top:.5rem; }
-  .relhead { display:flex; gap:.7rem; align-items:baseline; margin:.8rem 0 0; }
-  .relhead .v { font-size:1.15rem; letter-spacing:.04em; }
-  .relhead .d { font-size:.75rem; opacity:.5; }
-  .stages { display:flex; flex-wrap:wrap; gap:.35rem; margin:.6rem 0; }
-  .stage { font-size:.66rem; letter-spacing:.1em; text-transform:uppercase;
-    border:1px solid var(--line); border-radius:2px; padding:.25rem .5rem; opacity:.35; }
-  .stage.on { opacity:1; background:rgba(77,255,90,.2); border-color:var(--green); }
-  .stage.done { opacity:.7; }
-
-  /* -- network ----------------------------------------------------------- */
-  .probation { border:1px solid var(--amber); border-radius:3px; padding:.9rem;
-    margin-bottom:1rem; background:rgba(255,193,77,.08); color:var(--amber); }
-  .probation .count { font-size:2rem; letter-spacing:.04em; }
-  .netlist .row { cursor:pointer; }
-  .bars { display:inline-flex; gap:2px; align-items:flex-end; height:.9rem;
-    flex:none; }
-  .bars i { width:3px; background:var(--green); opacity:.25; }
-  .bars i.lit { opacity:1; }
-
-  /* -- the day, laid out -------------------------------------------------- */
-  .day { display:flex; height:2.6rem; border:1px solid var(--line); border-radius:2px;
-    overflow:hidden; margin:.8rem 0 .2rem; }
-  .day .seg { display:flex; align-items:center; justify-content:center;
-    font-size:.62rem; letter-spacing:.06em; overflow:hidden; white-space:nowrap;
-    border-right:1px solid rgba(77,255,90,.18); padding:0 .1rem; }
-  .day .seg:last-child { border-right:0; }
-  .day .seg.block { background:rgba(77,255,90,.24); }
-  .day .seg.gap { background:rgba(77,255,90,.03); opacity:.4; }
-  .day .seg.off { background:rgba(255,107,90,.22); color:var(--red); }
-  .day .seg.on { outline:1px solid var(--green); outline-offset:-1px; }
-  .hours { display:flex; font-size:.6rem; opacity:.4; margin-bottom:.9rem; }
-  .hours span { flex:1; text-align:left; }
-  .blockrow { display:flex; gap:.4rem; align-items:center; margin:.35rem 0; }
-  .blockrow input { min-height:2.6rem; }
-  .blockrow .t { flex:0 0 6.5rem; }
-  .blockrow .n { flex:1; }
-
-  /* -- toast ------------------------------------------------------------ */
-  #toast { position:fixed; left:50%; bottom:1rem; transform:translateX(-50%);
-    max-width:calc(100% - 2rem); border:1px solid var(--green); border-radius:2px;
-    background:#071109; padding:.6rem 1rem; z-index:60; font-size:.85rem;
-    opacity:0; transition:opacity .18s; pointer-events:none; }
-  #toast.show { opacity:1; }
-  #toast.bad { border-color:var(--red); color:var(--red); }
-  @media (prefers-reduced-motion: reduce) { #toast { transition:none; } }
-</style></head><body><div class="wrap">
+<style>""" + webstyle.CONSOLE_CSS + """</style></head><body><div class="wrap">
 
   <header>
     <p class="mark">JV PROJECTS</p>
@@ -2576,6 +3376,7 @@ PAGE = """<!doctype html>
     <button role="tab" aria-selected="true" data-tab="watch">WATCH</button>
     <button role="tab" aria-selected="false" data-tab="channels">CHANNELS</button>
     <button role="tab" aria-selected="false" data-tab="add">ADD</button>
+    <button role="tab" aria-selected="false" data-tab="library">FILES</button>
     <button role="tab" aria-selected="false" data-tab="settings">SETTINGS</button>
     <button role="tab" aria-selected="false" data-tab="tv">TV</button>
     <button role="tab" aria-selected="false" data-tab="system">SYSTEM</button>
@@ -2640,6 +3441,47 @@ PAGE = """<!doctype html>
     </div>
   </section>
 
+  <!-- The file manager. This is the only way anybody who bought this box can
+       see what is on its disk: there is no SSH, no keyboard and no screen but
+       the television. So it shows the box's own folders too, greyed and
+       unselectable, because a customer hunting forty missing gigabytes has to
+       be able to find them. -->
+  <section id="tab-library" hidden>
+    <div class="panel">
+      <h2>Files</h2>
+      <p class="note" id="lib-space">&hellip;</p>
+      <div class="crumbs" id="lib-crumbs"></div>
+      <div id="lib-list"><p class="empty">&hellip;</p></div>
+      <div class="pager" id="lib-pager" hidden>
+        <button id="lib-prev" class="ghost">&larr; BACK</button>
+        <span class="of" id="lib-of"></span>
+        <button id="lib-next" class="ghost">MORE &rarr;</button>
+      </div>
+      <div id="lib-confirm"></div>
+      <!-- Sticky, and always on the screen: SELECT ALL on a folder of six
+           hundred episodes otherwise puts this six hundred rows down. -->
+      <div class="libbar">
+        <button id="lib-all" class="ghost">SELECT ALL</button>
+        <span class="count" id="lib-count">nothing selected</span>
+        <button id="lib-rename" class="ghost" disabled>RENAME</button>
+        <button class="danger" id="lib-delete" disabled>DELETE</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Trash</h2>
+      <p class="note">Deleting moves things here rather than destroying them.
+        They stay on the same disk - still taking up the room - until the trash
+        is emptied, and the box clears anything older than a fortnight by
+        itself.</p>
+      <div id="lib-trash"><p class="empty">&hellip;</p></div>
+      <div id="lib-trash-confirm"></div>
+      <div class="bar" style="margin-top:.8rem">
+        <button class="danger ghost" id="lib-empty" disabled>EMPTY THE TRASH</button>
+      </div>
+    </div>
+  </section>
+
   <section id="tab-tv" hidden>
     <div class="panel">
       <h2>Schedule</h2>
@@ -2683,6 +3525,11 @@ PAGE = """<!doctype html>
   </section>
 
   <section id="tab-system" hidden>
+    <!-- Above Health, above Power, above everything: this is the panel that
+         explains why the buttons further down do not work. A customer who
+         reads it after pressing one has already had the bad experience. -->
+    <div class="panel alarm" id="privileges" hidden></div>
+
     <div class="panel">
       <h2>Health</h2>
       <div id="health"><p class="empty">&hellip;</p></div>
@@ -2725,7 +3572,12 @@ PAGE = """<!doctype html>
 
     <div class="panel">
       <h2>Clock</h2>
+      <!-- The alarm goes above the readings, not under them: a box that
+           thinks it is 2011 is already playing the wrong thing at every hour
+           of the day, and that is not a footnote to what time it says it is. -->
+      <div class="panel alarm" id="clock-alarm" hidden></div>
       <div id="clock"><p class="empty">&hellip;</p></div>
+      <div id="clock-detect"></div>
     </div>
 
     <div class="panel">
@@ -2796,7 +3648,16 @@ async function api(url, options) {
   const res = await fetch(url, options);
   let data = {};
   try { data = await res.json(); } catch (e) { /* empty body */ }
-  if (!res.ok) throw new Error(data.error || ('request failed: ' + res.status));
+  if (!res.ok) {
+    const failure = new Error(data.error || ('request failed: ' + res.status));
+    // The code as well as the words. Some refusals have a second answer the
+    // page can offer - a 409 from a restore means something is already at
+    // that name, and the honest reply is "replace it?" - and matching on the
+    // wording of a sentence to find that out would break the day somebody
+    // improves the sentence.
+    failure.status = res.status;
+    throw failure;
+  }
   return data;
 }
 const send = url => api(url, {method:'POST'}).catch(e => toast(e.message, true));
@@ -2826,7 +3687,7 @@ function arm(button, confirmLabel, run) {
 }
 
 /* -- tabs ---------------------------------------------------------------- */
-const TABS = ['watch', 'channels', 'add', 'tv', 'settings', 'system'];
+const TABS = ['watch', 'channels', 'add', 'library', 'tv', 'settings', 'system'];
 document.querySelectorAll('nav button').forEach(tab => {
   tab.onclick = () => {
     TABS.forEach(name => {
@@ -2837,6 +3698,7 @@ document.querySelectorAll('nav button').forEach(tab => {
     if (tab.dataset.tab === 'channels') loadEditor();
     if (tab.dataset.tab === 'settings') loadSettings();
     if (tab.dataset.tab === 'add') loadUnfinished();
+    if (tab.dataset.tab === 'library') loadLibrary();
     if (tab.dataset.tab === 'system') loadSystem();
     if (tab.dataset.tab === 'tv') loadTelevision();
   };
@@ -3701,6 +4563,455 @@ function resumeSession(session, items) {
 })();
 
 /* ========================================================================
+   Files: browse the disk, rename a folder, delete things, change your mind.
+
+   Two rules shape all of it.
+
+   1. Nothing is deleted. Everything selected is moved to a trash folder on
+      the same disk, which frees not one byte - so every screen that mentions
+      deleting says so, and the button that does free space is offered right
+      beside the one that does not.
+   2. The confirmation is the feature. "Are you sure?" is not a question
+      anybody can answer; "142 episodes, 38 GB, and channel 4 goes to NO
+      SIGNAL" is. Those sentences are written by the route, not here, because
+      they are the part that must not quietly stop being true.
+   ======================================================================== */
+const Lib = {
+  path: '', page: 1, pages: 1, sort: 'name', order: 'asc',
+  // path -> the row it came from, so the count, the rename and the delete all
+  // read from one place and a selection survives a redraw of the list.
+  picked: new Map(),
+  space: null, trashItems: 0, busy: false,
+};
+
+/* Deletes go up in batches so a select-all over six hundred episodes shows
+   real movement rather than a frozen page and a spinning phone. */
+const DELETE_BATCH = 25;
+
+function libBusy(on) {
+  Lib.busy = on;
+  ['#lib-all', '#lib-rename', '#lib-delete', '#lib-empty'].forEach(id => {
+    const button = $(id);
+    if (button) button.disabled = on;
+  });
+  if (!on) libCount();
+}
+
+function libCount() {
+  const n = Lib.picked.size;
+  $('#lib-count').textContent = n
+    ? (n + (n === 1 ? ' item selected' : ' items selected'))
+    : 'nothing selected';
+  if (Lib.busy) return;
+  $('#lib-delete').disabled = !n;
+  const only = n === 1 ? Lib.picked.values().next().value : null;
+  $('#lib-rename').disabled = !(only && only.kind === 'folder');
+  $('#lib-empty').disabled = !Lib.trashItems;
+}
+
+function libWhen(stamp) {
+  if (!stamp) return '';
+  const d = new Date(stamp * 1000);
+  return d.toLocaleDateString() + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+function libRow(entry) {
+  const row = el('div', 'lib' + (entry.kind === 'system' ? ' system' : ''));
+
+  const tick = el('input');
+  tick.type = 'checkbox';
+  tick.checked = Lib.picked.has(entry.path);
+  /* The box's own folders are listed and cannot be picked. Seeing them is how
+     somebody finds where their disk went; picking them is how they break the
+     television. */
+  tick.disabled = !entry.selectable;
+  tick.setAttribute('aria-label', 'select ' + entry.name);
+  if (tick.checked) row.classList.add('on');
+  tick.onchange = () => {
+    if (tick.checked) Lib.picked.set(entry.path, entry);
+    else Lib.picked.delete(entry.path);
+    row.classList.toggle('on', tick.checked);
+    libCount();
+  };
+  row.append(tick);
+
+  if (entry.kind === 'folder') {
+    const open = el('button', 'name', entry.name);
+    open.type = 'button';
+    open.onclick = () => libGo(entry.path);
+    row.append(open);
+  } else {
+    const name = el('span', 'name', entry.name);
+    if (entry.note) name.title = entry.note;
+    row.append(name);
+  }
+
+  row.append(el('span', 'size', entry.kind === 'folder' ? '' : mb(entry.bytes || 0)));
+  row.append(el('span', 'kind',
+    entry.kind === 'system' ? 'THE BOX'
+    : entry.kind === 'folder' ? 'FOLDER'
+    : entry.kind === 'video' ? (entry.duration ? duration(entry.duration) : 'VIDEO')
+    : 'FILE'));
+  return row;
+}
+
+function libGo(path) {
+  Lib.path = path;
+  Lib.page = 1;
+  // A selection you can no longer see is a trap, so walking into a folder
+  // drops it rather than carrying it along invisibly.
+  Lib.picked.clear();
+  $('#lib-confirm').textContent = '';
+  loadLibrary();
+}
+
+async function loadLibrary() {
+  const host = $('#lib-list');
+  let data;
+  try {
+    data = await api('/api/library?path=' + encodeURIComponent(Lib.path) +
+      '&page=' + Lib.page + '&sort=' + Lib.sort + '&order=' + Lib.order);
+  } catch (e) {
+    host.textContent = '';
+    host.append(el('p', 'empty', e.message));
+    return;
+  }
+
+  Lib.path = data.path;
+  Lib.page = data.page;
+  Lib.pages = data.pages;
+
+  const trail = $('#lib-crumbs');
+  trail.textContent = '';
+  data.crumbs.forEach((crumb, i) => {
+    if (i) trail.append(el('span', 'sep', '/'));
+    const step = el('button', null, crumb.name);
+    step.type = 'button';
+    step.onclick = () => libGo(crumb.path);
+    trail.append(step);
+  });
+
+  host.textContent = '';
+  if (!data.entries.length) host.append(el('p', 'empty', 'There is nothing in here.'));
+  data.entries.forEach(entry => host.append(libRow(entry)));
+
+  $('#lib-pager').hidden = data.pages < 2;
+  $('#lib-of').textContent = 'page ' + data.page + ' of ' + data.pages +
+    '  \\u00b7  ' + data.total + ' items';
+  $('#lib-prev').disabled = data.page <= 1;
+  $('#lib-next').disabled = data.page >= data.pages;
+  $('#lib-all').textContent = 'SELECT ALL';
+
+  libCount();
+  loadTrash();
+  loadSpace();
+}
+
+async function loadSpace() {
+  let s;
+  try { s = await api('/api/library/space'); } catch (e) { return; }
+  Lib.space = s;
+  const line = $('#lib-space');
+  const tight = s.total_bytes && s.free_bytes !== null &&
+                s.free_bytes < s.total_bytes * 0.1;
+  line.textContent = mb(s.free_bytes || 0) + ' free of ' + mb(s.total_bytes || 0) +
+    (s.trash_bytes
+      ? ('  \\u00b7  ' + mb(s.trash_bytes) + ' of that is sitting in the trash ' +
+         'and comes back the moment you empty it')
+      : '  \\u00b7  the trash is empty');
+  line.className = 'note' + (tight ? ' warn' : '');
+}
+
+async function loadTrash() {
+  const host = $('#lib-trash');
+  let data;
+  try { data = await api('/api/library/trash'); }
+  catch (e) { host.textContent = ''; host.append(el('p', 'empty', e.message)); return; }
+
+  Lib.trashItems = data.usage.items;
+  if (!Lib.busy) $('#lib-empty').disabled = !Lib.trashItems;
+
+  host.textContent = '';
+  if (!data.items.length) {
+    host.append(el('p', 'empty', 'The trash is empty.'));
+    return;
+  }
+  data.items.forEach(item => {
+    const row = el('div', 'lib');
+    row.append(el('span', 'name',
+      item.name + (item.from ? ('   from ' + item.from) : '')));
+    row.append(el('span', 'size', mb(item.bytes || 0)));
+    row.append(el('span', 'when', libWhen(item.deleted)));
+    const back = el('button', 'ghost', 'RESTORE');
+    back.type = 'button';
+    back.onclick = () => restoreFromTrash(item, back);
+    row.append(back);
+    host.append(row);
+  });
+  host.append(el('p', 'note', data.usage.items + ' item(s), ' +
+    mb(data.usage.bytes) + ', still using the disk. The box clears anything ' +
+    'older than ' + data.keep_days + ' days by itself.'));
+}
+
+async function restoreFromTrash(item, button) {
+  button.disabled = true;
+  button.textContent = 'PUTTING IT BACK\\u2026';
+  try {
+    await json('/api/library/trash/restore', 'POST', {token: item.token});
+    toast(item.name + ' is back in ' + (item.from || 'the library') + '.');
+  } catch (e) {
+    // 409 is the one refusal with a second answer worth offering.
+    if (e.status === 409) askToReplace(item);
+    else toast(e.message, true);
+  }
+  button.disabled = false;
+  button.textContent = 'RESTORE';
+  loadLibrary();
+}
+
+function askToReplace(item) {
+  const host = $('#lib-trash-confirm');
+  host.textContent = '';
+  const box = el('div', 'peril');
+  box.append(el('h3', null, 'SOMETHING IS ALREADY CALLED THAT'));
+  box.append(el('p', 'cost',
+    'There is already something called "' + item.name + '" in ' +
+    (item.from || 'the library') + '. Putting this one back would move that ' +
+    'one into the trash - it would not be destroyed, and you could put it ' +
+    'back the same way.'));
+  const bar = el('div', 'bar');
+  const no = el('button', 'ghost', 'LEAVE IT');
+  no.type = 'button';
+  no.onclick = () => { host.textContent = ''; };
+  const yes = el('button', 'danger', 'REPLACE IT');
+  yes.type = 'button';
+  yes.onclick = async () => {
+    yes.disabled = true;
+    yes.textContent = 'REPLACING\\u2026';
+    try {
+      await json('/api/library/trash/restore?confirm=yes', 'POST',
+                 {token: item.token, replace: true});
+      toast(item.name + ' is back. The one that was there went to the trash.');
+    } catch (e) { toast(e.message, true); }
+    host.textContent = '';
+    loadLibrary();
+  };
+  bar.append(no, yes);
+  box.append(bar);
+  host.append(box);
+}
+
+/* -- the confirmation, which is the whole point --------------------------- */
+$('#lib-delete').onclick = async () => {
+  if (!Lib.picked.size) return;
+  const host = $('#lib-confirm');
+  host.textContent = '';
+  host.append(el('p', 'note', 'Working out what that would cost\\u2026'));
+  let plan;
+  try {
+    plan = await json('/api/library/plan', 'POST',
+                      {paths: Array.from(Lib.picked.keys())});
+  } catch (e) {
+    host.textContent = '';
+    toast(e.message, true);
+    return;
+  }
+  drawDeleteConfirmation(plan);
+};
+
+function drawDeleteConfirmation(plan) {
+  const host = $('#lib-confirm');
+  host.textContent = '';
+  const box = el('div', 'peril');
+  const n = plan.items.length;
+  box.append(el('h3', null, 'DELETE ' + n + (n === 1 ? ' ITEM?' : ' ITEMS?')));
+
+  box.append(el('p', 'cost',
+    plan.totals.files + (plan.totals.files === 1 ? ' file' : ' files') +
+    (plan.totals.folders ? (' across ' + plan.totals.folders + ' folders') : '') +
+    ', ' + mb(plan.totals.bytes) + '.'));
+  // The sentence people go looking for on the storage gauge and do not find.
+  box.append(el('p', 'cost', plan.note));
+
+  if (plan.warnings.length) {
+    const list = el('ul');
+    plan.warnings.forEach(line => list.append(el('li', null, line)));
+    box.append(list);
+  }
+
+  const bar = el('div', 'bar');
+  const no = el('button', 'ghost', 'KEEP THEM');
+  no.type = 'button';
+  no.onclick = () => { host.textContent = ''; };
+  const yes = el('button', 'danger', plan.uploads
+    ? 'CANCEL THOSE UPLOADS AND DELETE'
+    : 'MOVE TO THE TRASH');
+  yes.type = 'button';
+  yes.onclick = () => runDelete(plan, yes);
+  bar.append(no, yes);
+
+  /* Offered here, next to the bad news. "This frees nothing" with no way to
+     free anything is how somebody ends up binning forty gigabytes twice. */
+  if (plan.space.reclaimable_bytes) {
+    const empty = el('button', 'danger ghost',
+      'EMPTY THE TRASH (' + mb(plan.space.reclaimable_bytes) + ')');
+    empty.type = 'button';
+    empty.onclick = () => askToEmpty();
+    bar.append(empty);
+  }
+  box.append(bar);
+  host.append(box);
+  box.scrollIntoView({block: 'nearest'});
+}
+
+async function runDelete(plan, button) {
+  const host = $('#lib-confirm');
+  // The route's own idea of each path, not the browser's: it has already
+  // resolved and checked them, and sending its answers back keeps the two
+  // halves of this from disagreeing about what was named.
+  const paths = plan.items.map(item => item.relative);
+
+  const meter = el('div', 'meter');
+  const fill = el('i');
+  fill.style.width = '0%';
+  meter.append(fill);
+  const pct = el('span', null, '0%');
+  const progress = el('div', 'progress');
+  progress.append(meter, pct);
+  host.append(progress);
+
+  libBusy(true);
+  button.disabled = true;
+  button.textContent = 'MOVING TO THE TRASH\\u2026';
+
+  const failed = [];
+  let moved = 0, done = 0;
+  for (let i = 0; i < paths.length; i += DELETE_BATCH) {
+    const batch = paths.slice(i, i + DELETE_BATCH);
+    try {
+      const out = await json('/api/library/delete?confirm=yes', 'POST',
+        {paths: batch, cancel_uploads: plan.uploads > 0});
+      moved += (out.deleted || []).length;
+      (out.failed || []).forEach(bad => failed.push(bad));
+    } catch (e) {
+      batch.forEach(path => failed.push({path: path, error: e.message}));
+    }
+    done += batch.length;
+    const share = Math.round(done * 100 / paths.length);
+    fill.style.width = share + '%';
+    pct.textContent = share + '%';
+  }
+
+  libBusy(false);
+  host.textContent = '';
+  Lib.picked.clear();
+  if (failed.length) {
+    toast(failed.length + ' could not be deleted: ' + failed[0].error, true);
+  } else {
+    toast(moved + ' moved to the trash. This freed no space - empty the ' +
+          'trash for that.');
+  }
+  loadLibrary();
+}
+
+function askToEmpty() {
+  const host = $('#lib-trash-confirm');
+  host.textContent = '';
+  const held = Lib.space || {};
+  const box = el('div', 'peril');
+  box.append(el('h3', null, 'EMPTY THE TRASH?'));
+  box.append(el('p', 'cost',
+    'This is the one thing on this box that destroys a video for good - ' +
+    (held.trash_items || 0) + ' item(s), ' + mb(held.trash_bytes || 0) +
+    '. It is also the step that actually gives the space back.'));
+  const bar = el('div', 'bar');
+  const no = el('button', 'ghost', 'NOT YET');
+  no.type = 'button';
+  no.onclick = () => { host.textContent = ''; };
+  const yes = el('button', 'danger', 'EMPTY IT FOR GOOD');
+  yes.type = 'button';
+  yes.onclick = async () => {
+    yes.disabled = true;
+    yes.textContent = 'EMPTYING\\u2026';
+    try {
+      const out = await api('/api/library/trash?confirm=yes', {method: 'DELETE'});
+      toast('Emptied ' + out.items + ' item(s) and got back ' + mb(out.bytes) + '.');
+    } catch (e) { toast(e.message, true); }
+    host.textContent = '';
+    loadLibrary();
+  };
+  bar.append(no, yes);
+  box.append(bar);
+  host.append(box);
+  box.scrollIntoView({block: 'nearest'});
+}
+
+/* -- renaming a folder, which repoints whatever plays from it ------------- */
+$('#lib-rename').onclick = () => {
+  if (Lib.picked.size !== 1) return;
+  const entry = Lib.picked.values().next().value;
+  const host = $('#lib-confirm');
+  host.textContent = '';
+
+  const box = el('div', 'edit');
+  const field = el('div', 'field');
+  field.append(el('label', null, 'A new name for ' + entry.name));
+  const input = el('input');
+  input.value = entry.name;
+  input.maxLength = 200;
+  field.append(input);
+  box.append(field);
+  box.append(el('p', 'note', 'Any channel or scheduled block playing from ' +
+    'this folder is repointed at the new name in the same step.'));
+
+  const bar = el('div', 'bar');
+  const no = el('button', 'ghost', 'CANCEL');
+  no.type = 'button';
+  no.onclick = () => { host.textContent = ''; };
+  const yes = el('button', null, 'RENAME');
+  yes.type = 'button';
+  yes.onclick = async () => {
+    yes.disabled = true;
+    yes.textContent = 'RENAMING\\u2026';
+    try {
+      const out = await json('/api/library/rename', 'POST',
+                             {path: entry.path, name: input.value});
+      toast(out.unchanged
+        ? 'That is already what it is called.'
+        : ('Renamed to ' + out.to + (out.channels.length
+            ? ('. Channel ' + out.channels.join(', ') + ' now plays from it.')
+            : '.')));
+      host.textContent = '';
+      Lib.picked.clear();
+      loadLibrary();
+    } catch (e) {
+      toast(e.message, true);
+      yes.disabled = false;
+      yes.textContent = 'RENAME';
+    }
+  };
+  bar.append(no, yes);
+  box.append(bar);
+  host.append(box);
+  input.focus();
+};
+
+$('#lib-all').onclick = () => {
+  const boxes = Array.from(
+    document.querySelectorAll('#lib-list .lib input[type=checkbox]')
+  ).filter(tick => !tick.disabled);
+  const turningOn = boxes.some(tick => !tick.checked);
+  boxes.forEach(tick => {
+    if (tick.checked !== turningOn) { tick.checked = turningOn; tick.onchange(); }
+  });
+  $('#lib-all').textContent = turningOn ? 'CLEAR THE SELECTION' : 'SELECT ALL';
+};
+
+$('#lib-prev').onclick = () => { Lib.page = Math.max(1, Lib.page - 1); loadLibrary(); };
+$('#lib-next').onclick = () => { Lib.page = Math.min(Lib.pages, Lib.page + 1); loadLibrary(); };
+$('#lib-empty').onclick = () => askToEmpty();
+
+/* ========================================================================
    System: is my box alright, what is it saying, and the buttons that
    only belong here.
    ======================================================================== */
@@ -3732,6 +5043,7 @@ function volumeLine(host, label, v) {
 }
 
 async function loadSystem() {
+  loadPrivileges();          // first, and not awaited: it is the top of the page
   let s;
   try { s = await api('/api/system'); }
   catch (e) { $('#health').textContent = ''; $('#health').append(el('p', 'empty', e.message)); return; }
@@ -3754,6 +5066,14 @@ async function loadSystem() {
       host.append(fact('', 'the library is on the same disk as the system'));
     }
   }
+  /* Right here in the storage block, not in a footnote. The trash is counted
+     in "used" above, so without this line it is gigabytes nothing on this box
+     can account for - which is exactly how it becomes a support call. */
+  const bin = s.trash || {};
+  host.append(fact('Trash', bin.items
+    ? (bin.items + (bin.items === 1 ? ' item, ' : ' items, ') + mb(bin.bytes) +
+       '   \\u2190 still using this space until it is emptied')
+    : 'empty', bin.items ? 'warn' : ''));
 
   const hw = s.hardware || {};
   host.append(fact('Picture', (hw.decode || {}).summary || 'unknown',
@@ -3771,6 +5091,7 @@ async function loadSystem() {
 
   $('#detail').textContent = JSON.stringify(s, null, 1);
   drawClock(s.timezone || {});
+  loadClock();               // not awaited: it shells out, and it is a panel
   drawPresses((s.input || {}).recent || []);
   drawBackupInfo();
   loadUpdates();
@@ -3782,6 +5103,98 @@ $('#detail-toggle').onclick = () => {
   raw.hidden = !raw.hidden;
   $('#detail-toggle').textContent = raw.hidden ? 'SHOW THE RAW DETAIL' : 'HIDE THE RAW DETAIL';
 };
+
+/* -- can this box still do what these buttons ask? ------------------------
+   Asked when this page opens, and when somebody presses CHECK AGAIN. Never
+   on a timer: the answer costs one short-lived process per privileged
+   command, on a box that is playing video, and there is no login here to
+   stop a browser left open on this tab asking for it all night. */
+async function loadPrivileges() {
+  let state;
+  try { state = await api('/api/system/privileges'); }
+  catch (e) { return; }        // a check that could not run is not a fault
+  drawPrivileges(state);
+}
+
+function drawPrivileges(state, note) {
+  const box = $('#privileges');
+  box.textContent = '';
+  if (!state || !state.needs_repair) { box.hidden = true; return; }
+  box.hidden = false;
+
+  box.append(el('p', 'now', state.headline));
+  box.append(el('p', null, state.message));
+
+  /* Named one by one, in the words printed on them. "Some features are
+     unavailable" is what the box may as well not say at all. The box knows
+     which GROUPS of commands were refused rather than which single button, so
+     this is what the fault affects rather than a promise about every one of
+     them - on the unit this was found on, Shut Down was the one that still
+     worked while the rest of the same group did not. */
+  if ((state.buttons || []).length) {
+    box.append(el('p', null, 'This affects:'));
+    const list = el('ul');
+    for (const button of state.buttons) list.append(el('li', null, button));
+    box.append(list);
+  }
+
+  /* The answer to whatever just happened, if something did: the honest "this
+     is not something the dashboard is allowed to do", in its own words. */
+  if (note) box.append(el('p', null, note));
+
+  /* The only place in this entire product where anybody is told to type a
+     command. It is here because the alternative is a page with no password on
+     it being able to write sudo's own configuration, which would hand the box
+     to anyone on the network - so the command is shown for the faults typing
+     it actually fixes, and never for the one it does not. */
+  if (state.repairable) {
+    box.append(el('p', null,
+      'Type this on the box itself, signed in as ' + state.user + ':'));
+    const command = el('code', 'typeit', state.command);
+    box.append(command);
+
+    const bar = el('div', 'bar');
+    const copy = el('button', 'ghost', 'COPY THE COMMAND');
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(state.command);
+        toast('Copied.');
+      } catch (e) {
+        // Clipboard needs a secure context in some browsers and this page is
+        // plain HTTP by design. Highlighting it beats failing silently.
+        const range = document.createRange();
+        range.selectNodeContents(command);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        toast('Highlighted it - copy it from there.');
+      }
+    };
+    /* One click, and an honest answer either way. Unprivileged - which is
+       what the dashboard always is on a real box - this changes nothing and
+       says so, which is the whole point: the reply is the sentence explaining
+       why, not a spinner and a lie. */
+    const fix = el('button', null, 'TRY THE REPAIR FROM HERE');
+    fix.onclick = async () => {
+      fix.disabled = true;
+      try {
+        const done = await api('/api/system/privileges/repair', {method: 'POST'});
+        if (done.applied) {
+          toast('The permission is back.');
+          loadPrivileges();
+          return;
+        }
+        drawPrivileges(state, done.message);
+      } catch (e) {
+        drawPrivileges(state, e.message);
+      }
+    };
+    const again = el('button', 'ghost', 'CHECK AGAIN');
+    again.onclick = () => loadPrivileges();
+    bar.append(fix, copy, again);
+    box.append(bar);
+  }
+}
 
 /* -- the remote test ------------------------------------------------------ */
 function drawPresses(rows) {
@@ -3882,11 +5295,78 @@ function drawClock(clock) {
       await json('/api/system/timezone', 'POST', {timezone: picker.value});
       toast('Timezone set to ' + picker.value);
       loadSystem();
-    } catch (e) { toast(e.message, true); }
+    } catch (e) {
+      toast(e.message, true);
+      /* Setting the clock is one of the things this box needs root for, so a
+         refusal here is the same fault the banner exists for. The toast is
+         gone in four seconds; the fault is not, and the banner is the only
+         thing on the page that says what actually fixes it. */
+      loadPrivileges();
+    }
   };
   const field = el('div', 'field');
   field.append(el('label', null, 'Timezone'), picker);
   host.append(field);
+}
+
+/* The other half of the clock: whether it is right at all, and the one
+   outbound request this product makes on its own.
+
+   Asked when this page opens and after a change, never on a timer - it shells
+   out to timedatectl, and this page has no login on it to stop a browser left
+   open on this tab asking all night. */
+async function loadClock() {
+  let clock;
+  try { clock = await api('/api/system/clock'); }
+  catch (e) { return; }        // a reading that failed is not a fault to shout
+  drawClockAlarm(clock);
+  drawDetection(clock.detection || {});
+}
+
+function drawClockAlarm(clock) {
+  const box = $('#clock-alarm');
+  box.textContent = '';
+  /* headline is set for the quiet case too - a clock the network has already
+     corrected, which will be wrong again after the next power cut and which
+     nobody would otherwise ever learn about. alarm is the loud one: wrong
+     now, and nothing is going to fix it by itself. */
+  if (!clock || !clock.headline) { box.hidden = true; return; }
+  box.hidden = false;
+  box.append(el('p', 'now', clock.headline));
+  if (clock.detail) box.append(el('p', null, clock.detail));
+  const sync = clock.sync || {};
+  if (sync.fix) box.append(el('p', null, sync.fix));
+}
+
+function drawDetection(detection) {
+  const host = $('#clock-detect');
+  host.textContent = '';
+  if (detection.enabled === undefined) return;
+
+  const picker = el('select');
+  for (const [v, label] of [['yes', 'On'], ['no', 'Off']]) {
+    const option = el('option', null, label);
+    option.value = v;
+    if ((v === 'yes') === detection.enabled) option.selected = true;
+    picker.append(option);
+  }
+  picker.onchange = async () => {
+    try {
+      const body = await json('/api/system/clock/detection', 'POST',
+                              {enabled: picker.value === 'yes'});
+      toast(body.note || 'Saved.');
+      loadSystem();
+    } catch (e) { toast(e.message, true); loadClock(); }
+  };
+  const field = el('div', 'field');
+  field.append(el('label', null, 'Work out where this box is'), picker);
+  host.append(field);
+
+  /* Printed beside the switch and never behind a "learn more". This is the
+     one feature in the product that sends anything to anybody, and the
+     sentence that says exactly what leaves the box is the reason somebody can
+     make an informed decision about the switch above. */
+  host.append(el('p', 'note', detection.what_is_sent || ''));
 }
 
 /* -- the config file ------------------------------------------------------ */
@@ -3986,7 +5466,17 @@ async function loadSchedule() {
   const c = data.clock || {};
   clock.append(fact('Box time', (c.local_time || '') + '   ' + (c.timezone || ''),
                     c.warning ? 'warn' : ''));
-  if (c.warning) {
+  if (c.sync_summary) clock.append(fact('Clock last set', c.sync_summary));
+  /* Two different faults, said in the order they matter. A date from before
+     this software existed is not drift - every daypart on this page is
+     already firing at the wrong hour, and the cause is a two-dollar part. */
+  if (c.plausible === false) {
+    clock.append(el('p', 'note warn',
+      'This box thinks it is a completely different day, so every time on ' +
+      'this page is already being read against the wrong clock. Connect the ' +
+      'box to the internet and it will correct itself within a minute. See ' +
+      'SYSTEM for what to do if it keeps coming back wrong.'));
+  } else if (c.warning) {
     clock.append(el('p', 'note warn',
       'Nothing is keeping this clock correct, so it will drift - and a ' +
       'schedule is only as right as the clock it runs on. Fix that under ' +
@@ -4279,6 +5769,83 @@ async function loadBranding() {
   drawAppearance(data);
 }
 
+/* ------------------------------------------------------------------------
+   The live picture preview.
+
+   The sliders below change the television as they move, because curvature has
+   no correct value and the only way anybody sets it is by looking at the
+   screen while they drag. Nothing here saves anything: the box puts the saved
+   picture back on its own after twenty seconds of silence (app.py,
+   CRT_PREVIEW_HOLD_SECONDS), so a tab closed mid-drag cannot leave somebody's
+   television permanently curved.
+
+   THE THROTTLE. Every preview that lands makes mpv compile a new shader, on a
+   two-core Celeron that is also decoding video. A slider fires an event per
+   pixel of travel, so at most one message goes out per PREVIEW_EVERY_MS while
+   a control is moving - and one more when it is let go, which is the whole
+   point: the throttle will have swallowed the last few pixels, and the value
+   the customer stopped on is the one they expect to be looking at. The box
+   has a throttle of its own (app.py, _flush_crt) for callers who are not this
+   page; this one is here to stop the messages being sent at all.
+   ------------------------------------------------------------------------ */
+const PREVIEW_EVERY_MS = 400;
+/* And the other half of it: the box gives a preview up after twenty seconds
+   with nothing heard, which is what makes walking away safe - but somebody who
+   drags a slider and then just LOOKS at the television for half a minute has
+   not gone anywhere, and having the picture snap back to saved underneath them
+   while the sliders still show their value would be baffling. So while the
+   Picture panel is actually in front of somebody, the value it is showing is
+   re-sent. An unchanged value costs the box nothing: app.py compares it to
+   what is on the screen and compiles no shader. */
+const PREVIEW_HEARTBEAT_MS = 8000;
+const Preview = {last: 0, timer: null, read: null, sent: null, live: false};
+
+/* "In front of somebody" means both of these, and neither is a courtesy: a
+   phone that locked its screen and a tab left on another section are exactly
+   the cases where the picture must go back on its own. */
+const watchingThePicture = () =>
+  document.visibilityState === 'visible' && !$('#tab-tv').hidden;
+
+/* `again` is the heartbeat, which re-sends a value that has not changed on
+   purpose. Everything else skips an unchanged panel: letting go of a slider
+   fires pointerup and change together, and a picture that is already right is
+   not worth two more messages. */
+async function sendPreview(again) {
+  if (!Preview.read) return;
+  const body = JSON.stringify(Preview.read());
+  if (!again && body === Preview.sent) return;
+  Preview.last = Date.now();
+  Preview.sent = body;
+  Preview.live = true;
+  /* Silent on failure. A television that is not running answers every one of
+     these, and a toast per slider pixel is worse than no picture change at
+     all - SAVE PICTURE SETTINGS still says so, in one sentence, once. The
+     value is forgotten so the next nudge tries again rather than deciding
+     nothing has changed. */
+  try { await json('/api/branding/preview/picture', 'POST', JSON.parse(body)); }
+  catch (e) { Preview.sent = null; }
+}
+
+/* `settled` is a control being let go, which always sends. */
+function previewSoon(settled) {
+  if (Preview.timer) { clearTimeout(Preview.timer); Preview.timer = null; }
+  if (settled) { sendPreview(false); return; }
+  const wait = Math.max(0, PREVIEW_EVERY_MS - (Date.now() - Preview.last));
+  Preview.timer = setTimeout(
+    () => { Preview.timer = null; sendPreview(false); }, wait);
+}
+
+setInterval(() => {
+  if (Preview.live && watchingThePicture()) sendPreview(true);
+}, PREVIEW_HEARTBEAT_MS);
+
+/* Leaving the page puts the saved picture back, rather than making somebody
+   wait out the box's own timeout wondering what they have done. sendBeacon
+   because a fetch started during pagehide is not guaranteed to leave. */
+addEventListener('pagehide', () => {
+  if (Preview.live) navigator.sendBeacon('/api/branding/preview/cancel');
+});
+
 function drawAppearance(data) {
   const host = $('#appearance');
   host.textContent = '';
@@ -4291,16 +5858,70 @@ function drawAppearance(data) {
     if ((v === 'yes') === crt.enabled) option.selected = true;
     enabled.append(option);
   }
-  const curve = el('input');
-  curve.type = 'range'; curve.min = 0; curve.max = 50; curve.step = 1;
-  curve.value = String(Math.round((crt.curvature || 0) * 100));
+  /* Every knob the shader is generated from, on the same slider scale: the
+     API takes fractions, a person drags whole numbers. The three that used to
+     be missing - scanlines, how strong they are, and how dark the edges go -
+     were already accepted by the endpoint with nothing on the page sending
+     them, which is a setting that exists only for whoever reads the source. */
+  const scanlines = el('select');
+  for (const [v, label] of [['yes', 'On'], ['no', 'Off']]) {
+    const option = el('option', null, label);
+    option.value = v;
+    if ((v === 'yes') === crt.scanlines) option.selected = true;
+    scanlines.append(option);
+  }
+
+  function slider(value, max, fallback) {
+    const input = el('input');
+    input.type = 'range'; input.min = 0; input.max = max; input.step = 1;
+    input.value = String(Math.round(
+      (value === undefined || value === null ? fallback : value) * 100));
+    return input;
+  }
+  const curve = slider(crt.curvature, 50, 0);
+  const lines = slider(crt.scanline_intensity, 100, 0);
+  const edges = slider(crt.vignette, 100, 0);
+  const corners = slider(crt.corner_radius, 30, 0);
 
   const banner = el('input');
   banner.type = 'number'; banner.min = 0; banner.max = 60; banner.step = 1;
   banner.value = String(osd.channel_bug_seconds || 4);
 
+  /* The whole panel, in the API's own words. Sent as one on every preview:
+     the television merges what arrives onto what it is already showing, and
+     six named settings is one short line either way.
+
+     `sent` is forgotten here rather than kept, because this runs after a save
+     and after PUT THE SAVED PICTURE BACK - both of which change what is on
+     the television without going through sendPreview. Remembering the old
+     value across one of those would skip the next preview of it. */
+  Preview.sent = null;
+  Preview.read = () => ({
+    crt_enabled: enabled.value === 'yes',
+    curvature: Number(curve.value) / 100,
+    corner_radius: Number(corners.value) / 100,
+    vignette: Number(edges.value) / 100,
+    scanlines: scanlines.value === 'yes',
+    scanline_intensity: Number(lines.value) / 100,
+  });
+  for (const input of [curve, corners, edges, lines]) {
+    /* Dragging: throttled. Let go: sent, whatever the throttle was doing, so
+       the value under the finger when it lifted is the value on the screen.
+       `change` covers the keyboard and the touch cases `pointerup` misses. */
+    input.oninput = () => previewSoon(false);
+    input.onpointerup = () => previewSoon(true);
+    input.onchange = () => previewSoon(true);
+  }
+  for (const picker of [enabled, scanlines]) {
+    picker.onchange = () => previewSoon(true);   // one press, one message
+  }
+
   for (const [label, input] of [['CRT picture effect', enabled],
                                 ['How curved', curve],
+                                ['Rounded corners', corners],
+                                ['Darkened edges', edges],
+                                ['Scanlines', scanlines],
+                                ['How strong the scanlines are', lines],
                                 ['Channel banner, seconds', banner]]) {
     const field = el('div', 'field');
     field.append(el('label', null, label), input);
@@ -4313,14 +5934,37 @@ function drawAppearance(data) {
       const body = await json('/api/branding/appearance', 'POST', {
         crt_enabled: enabled.value === 'yes',
         curvature: Number(curve.value) / 100,
+        corner_radius: Number(corners.value) / 100,
+        vignette: Number(edges.value) / 100,
+        scanlines: scanlines.value === 'yes',
+        scanline_intensity: Number(lines.value) / 100,
         channel_bug_seconds: Number(banner.value),
       });
+      /* Saved, so there is no preview left to put back: the television's
+         reload promotes what is on the screen to what is in config.yaml. */
+      Preview.live = false;
       toast(body.note || 'Saved.');
       loadBranding();
     } catch (e) { toast(e.message, true); }
   };
-  const preview = el('button', 'ghost', 'SHOW IT ON THE TV');
-  preview.onclick = async () => {
+  const undo = el('button', 'ghost', 'PUT THE SAVED PICTURE BACK');
+  undo.onclick = async () => {
+    try {
+      await api('/api/branding/preview/cancel', {method: 'POST'});
+      Preview.live = false;
+      toast('Back to your saved picture.');
+      loadBranding();                 // and the sliders go back with it
+    } catch (e) { toast('The TV is not running', true); }
+  };
+  /* This button used to say SHOW IT ON THE TV, sitting under sliders that did
+     nothing until it was pressed - and it never sent the sliders anywhere: it
+     asked for the channel banner. The sliders are live now, so that label
+     would be a lie about the panel it is in, but the button still has a real
+     job. The banner length above it is the one setting here that no slider
+     can show you, and INFO is exactly how a viewer sees it. So it keeps the
+     job it always did and finally says so. */
+  const bannerPreview = el('button', 'ghost', 'SHOW THE CHANNEL BANNER');
+  bannerPreview.onclick = async () => {
     try {
       await api('/api/branding/preview', {method: 'POST'});
       toast('Look at the television.');
@@ -4328,11 +5972,17 @@ function drawAppearance(data) {
   };
   const bar = el('div', 'bar');
   bar.style.marginTop = '.8rem';
-  bar.append(save, preview);
+  bar.append(save, undo, bannerPreview);
   host.append(bar);
   host.append(el('p', 'note',
-    'The CRT effect is set up when the television starts, so a change to it ' +
-    'needs a restart before you see it.'));
+    'The sliders change the television as you move them. Nothing is kept '
+    + 'until you press SAVE PICTURE SETTINGS, and if you walk away the box '
+    + 'puts your saved picture back on its own.'));
+  /* There was a note here saying the CRT effect needed a restart. It does not:
+     the reload the save triggers puts a new shader on the picture that is
+     already showing. The note was printed directly underneath the button that
+     had just changed the television, which is the worst place in the product
+     to be wrong. */
 }
 
 /* ========================================================================
@@ -4390,6 +6040,23 @@ function drawProbation(change) {
       box.hidden = false;
       box.textContent = '';
       box.append(el('p', 'now', 'Put back'), el('p', null, change.message));
+      const bar = el('div', 'bar');
+      const ok = el('button', 'ghost', 'DISMISS');
+      ok.onclick = () => { box.hidden = true; };
+      bar.append(ok);
+      box.append(bar);
+    } else if (change.phase === 'kept' && change.in_effect === false
+               && change.message) {
+      // A keep this box had to finish for itself, on settings netplan would
+      // not start using. It is the only state where the box is telling you
+      // one thing and doing another, switching it off and on again is the
+      // whole of the fix, and this panel is the only place it gets said - so
+      // an ordinary Keep, which has nothing to add, deliberately shows
+      // nothing here at all.
+      box.hidden = false;
+      box.textContent = '';
+      box.append(el('p', 'now', 'Kept, but not in use yet'),
+                 el('p', null, change.message));
       const bar = el('div', 'bar');
       const ok = el('button', 'ghost', 'DISMISS');
       ok.onclick = () => { box.hidden = true; };
@@ -4521,7 +6188,14 @@ async function submitNetwork(url, payload, describe) {
       }
       return;
     }
-    if (!res.ok) { toast(data.error || 'That was refused', true); return; }
+    if (!res.ok) {
+      toast(data.error || 'That was refused', true);
+      /* Writing netplan is privileged too, so the same rule as the clock and
+         the Power buttons: a refusal leaves the banner up rather than a toast
+         that has vanished by the time anybody reads it. */
+      loadPrivileges();
+      return;
+    }
     $('#net-form').textContent = '';
     drawProbation(data);
     if (describe) findTheBoxAgain(describe);
@@ -4797,7 +6471,13 @@ for (const [action, label, confirmLabel, danger] of SERVICES) {
       const data = await json(`/api/system/service/${action}?confirm=yes`, 'POST', {});
       toast(data.message);
       if (action === 'restart-dashboard') waitForDashboard();
-    } catch (e) { toast(e.message, true); }
+    } catch (e) {
+      toast(e.message, true);
+      // A button that just came back refused is the best possible moment to
+      // find out whether this box has lost its permission - and the toast is
+      // gone in four seconds, where the banner stays until it is fixed.
+      loadPrivileges();
+    }
   });
   $('#service-buttons').append(button);
 }

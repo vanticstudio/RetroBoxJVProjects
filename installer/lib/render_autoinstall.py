@@ -131,11 +131,28 @@ def main(argv):
     except OSError as exc:
         fail("could not read the template: %s" % exc)
 
+    # The wifi placeholder stands for a multi-line indented netplan block, so
+    # unlike the scalar placeholders it may appear exactly once. Mentioning its
+    # name a second time - in a comment, say - substitutes a whole `wifis:`
+    # block into the middle of that sentence and the answer file quietly stops
+    # being YAML. That has happened; this is cheaper than finding out from
+    # subiquity.
+    if doc.count("__WIFI_BLOCK__") != 1:
+        fail("the template mentions __WIFI_BLOCK__ %d times; it stands for a "
+             "whole netplan block and may appear exactly once (not even in a "
+             "comment)" % doc.count("__WIFI_BLOCK__"))
+
+    # The hash and the key are pasted into a document that is later PARSED as
+    # YAML, so - like the wifi SSID/password below - they go through
+    # yaml_str() rather than being trusted bare or hand-quoted in the
+    # template. The hash happens to contain no character that breaks a
+    # hand-typed single quote, which is luck, not a reason to skip this: an
+    # SSH key's comment field routinely holds an apostrophe.
     for placeholder, value in (
         ("__HOSTNAME__", hostname),
         ("__USERNAME__", username),
-        ("__PASSWORD_HASH__", hashed),
-        ("__SSH_AUTHORIZED_KEY__", key),
+        ("__PASSWORD_HASH__", yaml_str(hashed)),
+        ("__SSH_AUTHORIZED_KEY__", yaml_str(key)),
         ("__WIFI_BLOCK__", wifi),
     ):
         if placeholder not in doc:

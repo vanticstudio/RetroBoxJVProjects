@@ -44,6 +44,8 @@ id -u "${RETROBOX_USER}" > /dev/null 2>&1 || \
   die "user '${RETROBOX_USER}' does not exist - the autoinstall identity: section should have created it"
 [[ -d "${REPO_DIR}/.git" ]] || die "${REPO_DIR} is not a git clone"
 [[ -x "${REPO_DIR}/scripts/install.sh" ]] || die "${REPO_DIR}/scripts/install.sh is missing"
+[[ -x "${REPO_DIR}/installer/harden-boot.sh" ]] || \
+  die "${REPO_DIR}/installer/harden-boot.sh is missing - this box would wait for a network it may never have"
 
 RUN_GROUP="$(id -gn "${RETROBOX_USER}")"
 RUN_HOME="$(getent passwd "${RETROBOX_USER}" | cut -d: -f6)"
@@ -92,6 +94,25 @@ chown -R "${RETROBOX_USER}:${RUN_GROUP}" "${MEDIA_ROOT}"
 #     numbering them from max(existing)+1, i.e. 3, 4, 5... It skips paths that
 #     an explicit channel already claims and skips hidden folders, so channel 2
 #     below can never be duplicated.
+#
+# ${MEDIA_ROOT} is interpolated into that document below as a single-quoted
+# YAML scalar, twice. Single-quoting neutralises the characters that would
+# otherwise be read specially by a YAML parser (':', '#') - but it cannot
+# neutralise a single quote IN the value, and it cannot stop a literal
+# newline from ending the line early and either truncating the document or
+# injecting a bare, unquoted extra "line" into it. Caught here, before
+# anything is written, because the alternative is a box that either builds
+# its lineup from the wrong folder (a stray '#' silently starts a comment) or
+# has a config.yaml that fails to parse on a fresh image, which is a unit
+# that will not start.
+if [[ "${MEDIA_ROOT}" == *"'"* || "${MEDIA_ROOT}" == *'"'* \
+   || "${MEDIA_ROOT}" == *'#'* || "${MEDIA_ROOT}" == *':'* \
+   || "${MEDIA_ROOT}" == *$'\n'* ]]; then
+  die "RETROBOX_MEDIA_ROOT ('${MEDIA_ROOT}') contains a quote, hash, colon or " \
+      "newline; that would corrupt the config.yaml this script writes. Pick " \
+      "a path without those characters."
+fi
+
 if [[ ! -f "${REPO_DIR}/config.yaml" ]]; then
   say "Writing ${REPO_DIR}/config.yaml"
   cat > "${REPO_DIR}/config.yaml" <<YAML
@@ -100,7 +121,7 @@ if [[ ! -f "${REPO_DIR}/config.yaml" ]]; then
 #
 # Drop a folder of videos into ${MEDIA_ROOT} (or into \\\\retrobox\\Library from
 # a PC) and it becomes a channel on the next start-up.
-media_root: ${MEDIA_ROOT}
+media_root: '${MEDIA_ROOT}'
 auto_channels: true
 
 # Channel 2 is a placeholder so the box always has a valid lineup, even with an
@@ -109,7 +130,7 @@ auto_channels: true
 channels:
   - number: 2
     name: "Retro Box"
-    path: ${MEDIA_ROOT}/.welcome
+    path: '${MEDIA_ROOT}/.welcome'
 YAML
 else
   say "${REPO_DIR}/config.yaml already exists - leaving it alone"
@@ -209,7 +230,52 @@ printf '\n   Library   : \\\\retrobox\\Library\n'
 printf '   TV        : systemctl status retrobox\n\n'
 MOTD
 
-# --- 8. Verify ---------------------------------------------------------------
+# --- 8. The whole disk -------------------------------------------------------
+# Ubuntu's guided LVM layout does not give the root LV the whole volume group.
+# subiquity's default sizing-policy allocates roughly HALF the VG on a disk
+# between 20 GB and 200 GB and leaves the rest unallocated, where nothing
+# reports it and nothing uses it. Measured on hardware: a 128 GB box came up
+# with 57 GB usable and 58 GB idle.
+#
+# autoinstall.yaml.template asks for `sizing-policy: all`, which is the correct
+# declarative fix. This is the second, independent mechanism - it claims
+# anything still unallocated and, more importantly, AUDITS the finished box and
+# shouts into this log if the root filesystem still does not account for the
+# disk. On a media appliance the size of the disk is the one number a customer
+# checks, and this failure is otherwise completely silent.
+#
+# Deliberately not fatal. A box using half its disk still plays television;
+# aborting the install would turn wasted space into no box at all. It warns
+# here, and it leaves retrobox-growfs.service behind to retry on every boot,
+# which is where an online filesystem grow is certain to work.
+#
+# Run after install.sh rather than before it: install.sh needs a few hundred MB
+# for the venv and the generated filler clips, which fits on even the halved
+# disk, and running last means the audit measures the box as it will ship.
+say "Making sure the root filesystem owns the whole disk"
+if ! "${REPO_DIR}/installer/storage-grow.sh"; then
+  warn "the whole-disk check did NOT pass - read the DISK SPACE block above"
+  warn "before this box goes anywhere. Nothing else in the product reports it."
+fi
+
+# --- 9. Nothing waits for a network ------------------------------------------
+# This box gets unplugged, carried to a friend's house and switched on with no
+# cable in it. That must end with a television playing, not with
+# "A start job is running for Wait for Network to be Configured" counting up to
+# 2min on somebody's TV while the picture stays black.
+#
+# Why the fix cannot live in our own unit files is written out at the top of
+# installer/harden-boot.sh. In short: scripts/setup_lan_share.sh enables smbd
+# and wsdd, whose Ubuntu packaging carries Wants=network-online.target, and
+# that target is what drags systemd-networkd-wait-online into every boot. The
+# two units this product authors are already clean.
+#
+# Run late, deliberately: install.sh has by now apt-installed samba and wsdd,
+# so their enablement symlinks already exist and this cleans up after them.
+say "Making sure nothing on this box waits for a network"
+"${REPO_DIR}/installer/harden-boot.sh"
+
+# --- 10. Verify --------------------------------------------------------------
 # `retrobox --check` is three-valued: 2 = the config is broken and the TV will
 # not start, 1 = the config is fine but there is no media yet, 0 = fine with
 # media. A brand-new box legitimately returns 1, so only 2 is a failure.
@@ -241,6 +307,22 @@ done
   die "${REPO_DIR}/.venv/bin/retrobox-web is missing - the [web] extra did not install"
 [[ -f /etc/sudoers.d/retrobox-poweroff ]] || warn "the poweroff sudoers rule is missing; the remote's shutdown gesture will not work"
 [[ -f /etc/sudoers.d/retrobox-system ]] || warn "the system sudoers rule is missing; the dashboard cannot restart the TV or apply updates"
+
+# The boot hang, checked rather than assumed. A mask IS a symlink to /dev/null,
+# so this asks the exact question: can this unit still be loaded? If it can,
+# every box off this build waits up to two minutes for a network before the
+# television appears, and nobody finds out until one is in a living room.
+say "Verifying nothing will wait for the network at boot"
+for unit in systemd-networkd-wait-online.service NetworkManager-wait-online.service; do
+  masked="/etc/systemd/system/${unit}"
+  if [[ -L "${masked}" && "$(readlink "${masked}")" == "/dev/null" ]]; then
+    say "  ${unit} masked"
+  else
+    die "${unit} is NOT masked - with nothing plugged in, this box would count a red 'Wait for Network to be Configured' job up to two minutes on the customer's television, on every boot, for ever"
+  fi
+done
+[[ -f /etc/cloud/cloud-init.disabled ]] || \
+  warn "cloud-init is still enabled - see the harden-boot.sh output above for why it was left alone"
 
 say "Retro Box provisioning finished OK."
 say "On boot: TV on HDMI, dashboard at http://retrobox.local/"

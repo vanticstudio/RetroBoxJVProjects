@@ -26,6 +26,16 @@ Three things this module refuses to do:
   strands a box is the one that fails on the next cold start. So an update
   that passes its health check goes on *probation*, and the next few start-ups
   decide - see :meth:`Updater.on_boot`, which something has to call.
+* **Leave a box running code it is not allowed to run.** The list of things
+  this box may do as root lives in :data:`retrobox.servicectl.COMMANDS`, and
+  the sudoers fragment that grants them is generated from it - by the
+  installer, on the day the box was set up, and by nothing else. So the first
+  release that adds a privileged action meets a field full of boxes granting
+  the old list: the update reports success, the television keeps playing, and
+  the new button silently does nothing on every unit at once. An update
+  therefore regenerates that permission from the code it has just installed
+  and proves sudo will act on it, before it restarts anything - see
+  :func:`refresh_privileges`.
 """
 
 from __future__ import annotations
@@ -35,11 +45,14 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from . import servicectl
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +65,19 @@ _FORGETFUL = {"overlay", "overlayfs", "tmpfs", "ramfs", "squashfs", "aufs"}
 #: How long to wait for the television after a restart. Long enough for a cold
 #: mpv on a small box, short enough that nobody thinks it has hung.
 HEALTH_TIMEOUT = 90.0
+
+#: What an update records when it could not get an answer about the box's
+#: permission at all. servicectl has no such state, because servicectl always
+#: answers; this is for the process that asked and got nothing back. It is not
+#: "no", and it is emphatically not "yes".
+PRIVILEGES_UNKNOWN = "unknown"
+
+#: How long to allow for the permission check. It is one short-lived
+#: ``sudo -n -l`` per privileged command - a couple of dozen on a fully
+#: equipped box - on hardware that is also playing video. Nothing in it waits
+#: for a password, because ``-n`` forbids that, so anything past this is a
+#: wedged sudo, and a wedged sudo must not hold an update open for ever.
+PRIVILEGE_TIMEOUT = 120.0
 
 
 class UpdateError(Exception):
@@ -136,6 +162,145 @@ def player_is_healthy(timeout: float = HEALTH_TIMEOUT) -> bool:
             return True
         time.sleep(2.0)
     return False
+
+
+# ==========================================================================
+# The permission the box needs in order to run its own buttons
+# ==========================================================================
+def refresh_privileges() -> Dict[str, Any]:
+    """Put this box's sudo permission back in step with the code, and prove it.
+
+    Two steps, and it is the second one that decides anything.
+
+    **Regenerating** comes first, and on a box in somebody's living room it
+    does nothing at all: :func:`retrobox.servicectl.repair` only writes
+    ``/etc/sudoers.d`` when it is running as root, and the process that applies
+    an update is the dashboard, which is not root and never will be. That is
+    not a gap waiting to be closed - a sudoers rule letting a web page with no
+    password on it write sudo's own configuration would hand this box to
+    anyone on the home network, which is a far worse bug than the one being
+    fixed here. It is done because there are two cases where it is honest:
+    somebody running the updater as root, and a box picking up a job it was
+    switched off in the middle of.
+
+    **Checking** is what actually decides. It asks sudo, once per command,
+    with ``-l``, which lists a command and never runs it - an update that
+    proved the reboot button worked by rebooting the box would be its own bug
+    report. What is compared is therefore behaviour rather than text: will
+    this box run this, right now, without a password. "visudo parsed it" is
+    not accepted as an answer, because "visudo parsed it" and "sudo acts on
+    it" are different questions and the difference between them is precisely
+    what shipped to a customer once.
+
+    Never raises: whatever calls this has an update in its hands.
+    """
+    answer: Dict[str, Any] = {
+        "state": PRIVILEGES_UNKNOWN,
+        "applied": False,
+        "headline": "",
+        "message": "",
+        "affected": [],
+        "refused": [],
+        "detail": "",
+        "command": _fix_command(),
+    }
+
+    try:
+        repaired = servicectl.repair()
+    except Exception:  # noqa: BLE001 - an update is riding on this answer
+        log.warning("could not regenerate this box's permission file", exc_info=True)
+    else:
+        answer["applied"] = bool(repaired.applied)
+        answer["command"] = repaired.command
+        if repaired.applied:
+            log.warning("regenerated %s from this version's command table",
+                        servicectl.SUDOERS_PATH)
+        else:
+            log.info("did not rewrite %s: %s", servicectl.SUDOERS_PATH, repaired.detail)
+
+    try:
+        check = servicectl.check_privileges()
+    except Exception:  # noqa: BLE001
+        log.warning("could not ask this box about its permission", exc_info=True)
+        return answer
+
+    answer.update({
+        "state": check.state,
+        "headline": check.headline,
+        "message": check.message,
+        "affected": list(check.affected),
+        # For the journal only. The caller must not put either of these on a
+        # page: they carry raw paths and sudo's own words, and neither is
+        # something the owner of a television can act on.
+        "refused": list(check.refused),
+        "detail": check.detail,
+        "command": check.command,
+    })
+    return answer
+
+
+def _fix_command() -> str:
+    """The one command that puts a stale permission right, ready to be pasted.
+
+    Taken from servicectl so the updater and the dashboard cannot end up
+    quoting a customer two different things.
+    """
+    try:
+        return servicectl.FIX_COMMAND
+    except Exception:                                    # pragma: no cover
+        return "cd ~/RetroBox && ./scripts/install-service.sh"
+
+
+def _parse_privileges(text: str) -> Optional[Dict[str, Any]]:
+    """The one line of JSON out of whatever else the subprocess printed.
+
+    Every line is looked at rather than just the last, because the answer
+    arrives mixed in with anything the new code's logging wrote about itself,
+    and the order those two end up in is not something to depend on.
+    """
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            answer = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(answer, dict) and isinstance(answer.get("state"), str):
+            return answer
+    return None
+
+
+def _privilege_reason(state: str) -> str:
+    """Why the update was undone, in the half-sentence that sits in brackets."""
+    if state == PRIVILEGES_UNKNOWN:
+        return "this box could not confirm it is allowed to run it"
+    return "this box has not been given permission to run it"
+
+
+def _privilege_advice(state: str, command: str) -> str:
+    """What the owner can do about it. Never sudo's words, never /etc."""
+    if state == PRIVILEGES_UNKNOWN:
+        return (
+            "This box could not check whether it is allowed to run the new "
+            "version, so it did not keep it. Nothing has been lost and it is "
+            "safe to try again. If it keeps happening, whoever set the box up "
+            f"can run one command on the box itself:  {command}"
+        )
+    return (
+        "This version needs to be allowed to do a little more than the one you "
+        "have, and the dashboard cannot give itself that - if it could, anyone "
+        "on your home network could take the box over. Whoever set the box up "
+        "can put it right with one command typed on the box itself, and then "
+        f"this update will install:  {command}"
+    )
+
+
+def _and_list(items: Sequence[str]) -> str:
+    parts = list(items)
+    if len(parts) < 2:
+        return parts[0] if parts else ""
+    return ", ".join(parts[:-1]) + " or " + parts[-1]
 
 
 class Updater:
@@ -302,9 +467,86 @@ class Updater:
         except UpdateError as exc:
             return self._roll_back(previous, version, str(exc))
 
-        # 3. Restart, then insist on seeing the picture come back.
+        # 3. The permission this box needs in order to run the code that has
+        #    just been installed - regenerated from that code, and proved,
+        #    before the television is restarted into it.
+        #
+        #    Where this step goes is decided by three things that pull in
+        #    different directions, so the reasoning is written down.
+        #
+        #    It has to come AFTER the checkout and the install, because the
+        #    sudoers fragment is generated from servicectl.COMMANDS, and it is
+        #    the NEW version's table that says what the new version runs. That
+        #    is the whole failure this exists for. It also cannot be asked in
+        #    this process: the dashboard imported retrobox.servicectl when it
+        #    started, possibly months ago, and is holding the OLD table in
+        #    memory - and re-importing a live dashboard's own modules under it
+        #    is not something to do on a box nobody can reach. So the question
+        #    goes to a fresh interpreter out of the box's own venv, which loads
+        #    the files that were just checked out. See main() below.
+        #
+        #    It has to come BEFORE the restart, because the picture going off
+        #    is the most alarming thing this box does, and there is no reason
+        #    to put somebody through it for a version that is about to be taken
+        #    away again.
+        #
+        #    And whatever it writes has to end up matching whatever version the
+        #    box actually ends up running. Regenerating from the new table and
+        #    then rolling back to the old code would leave a grant wider than
+        #    the running code needs, which is a security regression and not
+        #    merely untidy - so _roll_back() asks again once the old code is
+        #    back, and the grant follows the code in both directions. On a box
+        #    in the field nothing is ever written, because the dashboard is not
+        #    root on purpose and permanently, so out there this is a check and
+        #    there is nothing to narrow; the ordering matters for a root-run
+        #    updater and for a box finishing a job it lost power in the middle
+        #    of.
+        privileges = self._privileges()
+        granted = str(privileges.get("state") or PRIVILEGES_UNKNOWN)
+        self._write_state(privileges=granted)
+
+        # Compared against this version's constants even though the answer came
+        # from the next version's code. The four state names are the contract
+        # between the two, which is why they are short strings and not a
+        # structure - and anything not recognised falls through to the failure
+        # branch rather than being read as a yes.
+        if granted == servicectl.PRIVILEGES_BLOCKED:
+            # Not caused by this update, and not curable by undoing it. This is
+            # sudo unable to become root AT ALL, whatever any rule says - the
+            # NoNewPrivileges= shape - and it is a property of the unit file
+            # the dashboard is ALREADY running under, which nothing here has
+            # touched: the restart is still below this line. The previous
+            # version is therefore every bit as blocked as the new one, so
+            # rolling back would cost the customer their update and fix
+            # nothing. It is recorded, and it is shouted about in the journal,
+            # because it is real and it needs a different fix.
+            log.error(
+                "sudo on this box cannot become root at all, so the Power "
+                "buttons and the Network page do not work - the update is "
+                "going ahead anyway because going back would not change that"
+            )
+        elif granted != servicectl.PRIVILEGES_OK:
+            log.error(
+                "this box may not run what %s needs to run (%s); not keeping it",
+                version, granted,
+            )
+            return self._roll_back(
+                previous, version, _privilege_reason(granted),
+                advice=_privilege_advice(
+                    granted, str(privileges.get("command") or _fix_command())
+                ),
+            )
+
+        # 4. Restart, then insist on seeing the picture come back.
         self._write_state(stage="restarting", message="Restarting the television.")
-        self._run(["sudo", "-n", "systemctl", "restart", "retrobox.service"])
+        code, output = self._run(
+            ["sudo", "-n", "systemctl", "restart", "retrobox.service"]
+        )
+        if code != 0:
+            # Not fatal on its own - the health check below is the real gate,
+            # and it is about to fail if this mattered. Logged so that whoever
+            # reads the journal is not left guessing why.
+            log.error("could not restart the television: %s", (output or "")[:400])
 
         self._write_state(
             stage="health", message="Waiting for the television to come back.",
@@ -314,7 +556,7 @@ class Updater:
                 previous, version, "the television did not come back up",
             )
 
-        # 4. Installed, and on probation - not finished. All the health check
+        # 5. Installed, and on probation - not finished. All the health check
         #    above proves is that the television came back on a box that was
         #    already switched on. What strands a box in the field is the next
         #    cold start: a dependency that resolved badly, a migration that
@@ -349,6 +591,42 @@ class Updater:
         if code != 0:
             raise UpdateError(f"{' '.join(cmd[:2])} failed: {output[:400]}")
 
+    def _privileges(self) -> Dict[str, Any]:
+        """Ask the code on disk what it needs root for, and whether it has it.
+
+        Deliberately a subprocess, and deliberately the box's own venv python:
+        the point is to run the version that was just checked out, not the one
+        this process imported when the dashboard started. ``-m
+        retrobox.updater --privileges`` is a narrow contract between two
+        versions of this program - one flag in, one line of JSON out - which
+        is a far more stable thing for old code to depend on than the shape of
+        a Python API it has never seen.
+
+        Never raises, and never reads an answer it did not get: a box that
+        could not be asked has not said yes.
+        """
+        argv = [str(self.repo_dir / ".venv" / "bin" / "python"),
+                "-m", "retrobox.updater", "--privileges"]
+        code, output = self._run(argv, cwd=self.repo_dir, timeout=PRIVILEGE_TIMEOUT)
+        answer = _parse_privileges(output) if code == 0 else None
+        if answer is None:
+            log.error(
+                "this box could not be asked whether it may still run its own "
+                "privileged commands (exit %s): %s", code, (output or "")[-400:],
+            )
+            return {"state": PRIVILEGES_UNKNOWN, "applied": False,
+                    "command": _fix_command()}
+
+        if answer.get("state") != servicectl.PRIVILEGES_OK:
+            # The journal, and only the journal. Raw paths and sudo's own words
+            # live here and nowhere a customer can see them.
+            log.error(
+                "permission check says %r: %s | refused: %s",
+                answer.get("state"), answer.get("detail", ""),
+                "; ".join(answer.get("refused") or []) or "(nothing)",
+            )
+        return answer
+
     def _current_ref(self) -> str:
         code, output = self._run(
             ["git", "describe", "--tags", "--exact-match"], cwd=self.repo_dir
@@ -359,30 +637,88 @@ class Updater:
         return output.strip() if code == 0 else ""
 
     # -- the way back ------------------------------------------------------
-    def _roll_back(self, previous: str, attempted: str, why: str) -> Dict[str, Any]:
-        """Put the old version back and say so plainly."""
+    def _roll_back(
+        self, previous: str, attempted: str, why: str, *, advice: str = "",
+    ) -> Dict[str, Any]:
+        """Put the old version back, and say only what actually happened.
+
+        Every step here used to have its result thrown away, after which the
+        box wrote "It is working normally and nothing was lost" whether or not
+        a single one of them had worked. That sentence is read off a
+        television by somebody deciding whether the box can be left alone
+        until the morning, on an appliance with no shell and nobody to call,
+        so it has to be earned. Each step is checked now, and the reassuring
+        wording is used only when it is true; when it is not, the owner is
+        told the one thing they can actually do, and the next start-up picks
+        the job back up.
+        """
         log.error("update to %s failed (%s); rolling back to %s", attempted, why, previous)
         self._write_state(
             phase="rolling_back", stage="installing",
             message=f"That did not work. Putting {_strip(previous)} back.",
             error=why,
         )
+
+        trouble: List[str] = []
         if previous:
-            self._run(["git", "reset", "--hard", previous], cwd=self.repo_dir)
+            code, output = self._run(
+                ["git", "reset", "--hard", previous], cwd=self.repo_dir
+            )
+            if code != 0:
+                log.error("could not put the old version's files back: %s",
+                          (output or "")[:400])
+                trouble.append("put the old version's files back")
+
             # Reinstall as well: the old code with the new version's
             # dependencies in the venv is its own broken state.
-            self._run(self._pip_command(), cwd=self.repo_dir)
-        self._run(["sudo", "-n", "systemctl", "restart", "retrobox.service"])
+            code, output = self._run(self._pip_command(), cwd=self.repo_dir)
+            if code != 0:
+                log.error("could not reinstall the old version: %s",
+                          (output or "")[:400])
+                trouble.append("finish putting it back")
+
+            # The grant follows the code, in both directions. If the failed
+            # update regenerated the sudoers fragment from the new command
+            # table - which only happens when this is running as root, but it
+            # does happen - the box would now be on old code holding a grant
+            # wider than that code needs. Narrowing it again matters as much
+            # as widening it did. Asked here rather than trusted: this is the
+            # last thing done before the television comes back, and it never
+            # decides anything, because a rollback has to finish.
+            self._privileges()
+
+        code, output = self._run(
+            ["sudo", "-n", "systemctl", "restart", "retrobox.service"]
+        )
+        if code != 0:
+            log.error("could not restart the television: %s", (output or "")[:400])
+            trouble.append("restart the television")
 
         back_to = _strip(previous) or "the previous version"
-        self._write_state(
-            phase="rolled_back", stage="done", error=why, finished_at=self._clock(),
-            boots=0,
-            message=(
+        finished = not trouble
+        if finished:
+            message = (
                 f"The update to {attempted} did not work ({why}), so this box put "
                 f"{back_to} back by itself. It is working normally and nothing was "
                 f"lost - your channels, settings and videos are untouched."
-            ),
+            )
+        else:
+            message = (
+                f"The update to {attempted} did not work ({why}), so this box "
+                f"tried to put {back_to} back - and could not finish. It could "
+                f"not {_and_list(trouble)}. Your videos, your channels and your "
+                f"settings have not been touched. Switch the box off at the "
+                f"wall, wait a moment and switch it on again: it takes the job "
+                f"up again where it left off the next time it starts. If the "
+                f"television still does not come back after that, the box "
+                f"needs somebody who can type on it."
+            )
+        if advice:
+            message = message + " " + advice
+
+        self._write_state(
+            phase="rolled_back", stage="done", error=why, finished_at=self._clock(),
+            boots=0, rollback_complete=finished, message=message,
         )
         raise UpdateError(
             f"the update to {attempted} failed and was rolled back to {back_to}"
@@ -422,6 +758,28 @@ class Updater:
         # anything else looks at this file.
         if phase in ("running", "rolling_back"):
             return self._finish_what_was_interrupted(state)
+
+        # A rollback that could not finish. The message the owner was given
+        # says that switching the box off and on again takes the job up where
+        # it left off, and this is the line that makes that true - without it
+        # a box that failed to put the old version back sits there for ever,
+        # which is the box that has to be collected from somebody's house.
+        #
+        # Tested with `is False` on purpose. Every box in the field has a state
+        # file written before this key existed, and "I do not know" is not "it
+        # failed": reading a missing key as a failure would reset and reinstall
+        # every one of them at the next start-up.
+        if phase == "rolled_back" and state.get("rollback_complete") is False:
+            log.warning("the last rollback did not finish; trying again")
+            try:
+                self._roll_back(
+                    state.get("previous_ref") or "",
+                    state.get("to_version") or "the new version",
+                    state.get("error") or "the update did not work",
+                )
+            except UpdateError:
+                pass
+            return self.state()
 
         if phase != "probation":
             return state
@@ -603,14 +961,51 @@ def start_boot_check(
     return thread
 
 
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """``python -m retrobox.updater --privileges``, and nothing else.
+
+    An update has to ask the code it has just installed what that code needs
+    root for, and it cannot ask itself: the process doing the update imported
+    :mod:`retrobox.servicectl` when the dashboard started and is holding the
+    old command table. So the question goes to a fresh interpreter out of the
+    box's own venv, which loads the files that were just checked out, and the
+    answer comes back as one line of JSON - because an exit status and some
+    output are the only things the asking process has to go on.
+
+    This is an interface between two *versions* of this program, and an old
+    version has no way to find out what a new one changed. It is kept as
+    narrow as it can be for that reason: one flag in, one line of JSON out,
+    and every field in it a plain string, a boolean or a list of strings.
+
+    Nothing else is ever printed to stdout. Anything the new code wants to say
+    about itself goes to the log, which is stderr here, and the reader picks
+    the JSON out by looking at every line rather than assuming an order.
+    """
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments != ["--privileges"]:
+        sys.stderr.write("usage: python -m retrobox.updater --privileges\n")
+        return 2
+
+    sys.stdout.write(json.dumps(refresh_privileges(), sort_keys=True) + "\n")
+    return 0
+
+
+if __name__ == "__main__":                               # pragma: no cover
+    raise SystemExit(main())
+
+
 __all__ = [
     "HEALTH_TIMEOUT",
+    "PRIVILEGES_UNKNOWN",
+    "PRIVILEGE_TIMEOUT",
     "Persistence",
     "UpdateError",
     "Updater",
     "check_at_boot",
     "check_persistence",
     "installed_extras",
+    "main",
     "player_is_healthy",
+    "refresh_privileges",
     "start_boot_check",
 ]

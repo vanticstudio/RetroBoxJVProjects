@@ -59,9 +59,18 @@ def box(tmp_path, runtime, monkeypatch):
 
     # Braces: and stub the commands out anyway.
     ran = []
-    monkeypatch.setattr(
-        "retrobox.updater._run", lambda cmd, **kw: (ran.append(list(cmd)), (0, "v1.0.3"))[1]
-    )
+
+    def command(cmd, **kw):
+        ran.append(list(cmd))
+        if "--privileges" in cmd:
+            # An update asks the code it has just installed whether this box is
+            # still allowed to run the commands that code runs as root. This is
+            # what a healthy box answers - see updater.refresh_privileges().
+            return (0, json.dumps({"state": "ok", "applied": False,
+                                   "message": "", "command": ""}))
+        return (0, "v1.0.3")
+
+    monkeypatch.setattr("retrobox.updater._run", command)
     monkeypatch.setattr(
         "retrobox.updater.check_persistence", lambda p: Persistence(True, True, "")
     )
@@ -366,3 +375,53 @@ def test_a_ruined_update_record_still_gives_the_customer_a_dashboard(tmp_path, r
     client = app.test_client()
     assert client.get("/dash").status_code == 200
     assert client.get("/api/updates").get_json()["progress"]["phase"] == "idle"
+
+
+# ==========================================================================
+# What an update is allowed to say when a command was refused
+#
+# An update restarts the television, and it does that through sudo like
+# everything else. A box whose permission is out of date fails there, and
+# "sudo -n failed: sudo: a password is required" is not a sentence the owner
+# of a television can act on. The same rule applies here as on every other
+# page: the machine's words go to the journal, the customer gets English.
+# ==========================================================================
+def test_an_update_refused_by_sudo_does_not_quote_sudo_at_the_customer(
+    box, github, monkeypatch
+):
+    from retrobox import servicectl
+
+    client, _, _ = box
+    github.answer = json.dumps([release("v9.9.9")])
+    client.post("/api/updates/check")
+
+    def refuse(cmd, **kw):
+        if "--privileges" in cmd:
+            return 0, json.dumps({"state": "ok", "applied": False,
+                                  "message": "", "command": ""})
+        return 1, "sudo: a password is required"
+
+    monkeypatch.setattr("retrobox.updater._run", refuse)
+    res = client.post("/api/updates/apply?confirm=yes", json={"version": "9.9.9"})
+    said = res.get_json()["error"]
+    assert "sudo" not in said
+    assert "password" not in said
+    assert "install-service.sh" in said, "it never says what would put it right"
+
+
+def test_an_update_that_failed_for_another_reason_keeps_its_own_words(
+    box, github, monkeypatch
+):
+    client, _, _ = box
+    github.answer = json.dumps([release("v9.9.9")])
+    client.post("/api/updates/check")
+
+    def refuse(cmd, **kw):
+        if "--privileges" in cmd:
+            return 0, json.dumps({"state": "ok", "applied": False,
+                                  "message": "", "command": ""})
+        return 1, "fatal: could not read from remote repository"
+
+    monkeypatch.setattr("retrobox.updater._run", refuse)
+    res = client.post("/api/updates/apply?confirm=yes", json={"version": "9.9.9"})
+    assert "remote repository" in res.get_json()["error"]

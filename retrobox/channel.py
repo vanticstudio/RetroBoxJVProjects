@@ -29,7 +29,7 @@ _SEASON_PATTERNS = (
 )
 
 from .config import ChannelConfig, Config
-from .daypart import Daypart, minutes_since_midnight
+from .daypart import Daypart, resolve
 from .playlist import SequentialOrder, ShuffleBag, make_order
 from .probe import DEFAULT_EPISODE_SECONDS, flush_cache, probe_duration
 
@@ -82,11 +82,33 @@ def scan_episodes(
         for p in walker
         if p.is_file()
         and p.suffix.lower() in exts
-        and not p.name.startswith(".")
+        and not _is_hidden(p, root)
         and not _is_excluded(p, root, patterns, exclude_seasons)
     ]
     episodes.sort(key=lambda p: str(p).lower())
     return episodes
+
+
+def _is_hidden(path: Path, root: Path) -> bool:
+    """Is anything between the scanned folder and this file hidden?
+
+    Every folder the box keeps its own machinery in is dot-prefixed - the
+    upload spool, the welcome placeholder, and the trash the dashboard moves
+    deleted episodes into. Testing only ``path.name`` missed all of them,
+    because ``rglob`` walks happily into a dot-folder: a channel pointed at the
+    library root itself picked deleted episodes back out of the trash and put
+    them on the air, which is the one thing a trash must never do.
+
+    The check is RELATIVE to the folder being scanned, and that matters: the
+    installer seeds ``<media>/.welcome`` with the boot splash and points a
+    channel straight at it (installer/provision.sh). An absolute rule would
+    hide that clip and every new box would come up with nothing to play.
+    """
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:  # pragma: no cover - walker paths are always under root
+        parts = (path.name,)
+    return any(part.startswith(".") for part in parts)
 
 
 def _is_excluded(
@@ -226,15 +248,20 @@ class Channel:
 
     # -- dayparting ---------------------------------------------------------
     def _active(self, now: Optional[float] = None) -> Tuple[Optional[int], Optional[Daypart]]:
-        """Which daypart (index, window) is in effect - (None, None) for the default."""
+        """Which daypart (index, window) is in effect - (None, None) for the default.
+
+        Asked of the engine rather than worked out here, so that there is one
+        place that decides what is on air. That matters because the engine also
+        declines to decide at all when the box's clock cannot be believed, and
+        this is the only path playback takes - name, pool, off-air and resume
+        all come through here. A second copy of the loop would be a second copy
+        that dayparts a flat-battery box on a nonsense timestamp.
+        """
         parts = self.config.dayparts
         if not parts:
             return None, None
-        minute = minutes_since_midnight(self._wall_clock() if now is None else now)
-        for index, part in enumerate(parts):
-            if part.contains(minute):
-                return index, part
-        return None, None
+        decision = resolve(parts, self._wall_clock() if now is None else now)
+        return decision.index, decision.part
 
     def active_daypart(self, now: Optional[float] = None) -> Optional[Daypart]:
         return self._active(now)[1]

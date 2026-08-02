@@ -14,9 +14,22 @@
 #   ./scripts/install.sh              # install deps + assets
 #   ./scripts/install.sh --service    # ...and install & enable the systemd unit
 #
+# Run it as the account the box will run as, NOT with sudo - it asks for sudo
+# itself, for the handful of steps that need root. See refuse_a_root_install().
+#
+# This script and installer/provision.sh build the same box by different roads:
+# provision.sh is the unattended build on a blank disk, this is the documented
+# manual path. Where they drift, customers find out and installers do not, so
+# several of the steps below exist only to keep the two the same. Each says so.
+#
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Where the library lives. Same name and same default as provision.sh uses, and
+# unlike before it is now passed on to everything that needs to know - the file
+# share included, which used to create and share a second, empty folder of its
+# own on any box built with a different one.
+MEDIA_ROOT="${RETROBOX_MEDIA_ROOT:-/media/retrobox}"
 INSTALL_SERVICE=0
 SETUP_SHARE=1
 for arg in "$@"; do
@@ -30,6 +43,341 @@ done
 have_package() {
   apt-cache show "$1" > /dev/null 2>&1
 }
+
+# Say why, on stderr, and stop - with what to do next, always. Whoever reads
+# this has a half-installed appliance in front of them and no other source of
+# truth: no SSH once it ships, no log but this terminal, and a television that
+# may or may not come on.
+fail() {
+  printf '\n' >&2
+  printf '%s\n' "$@" >&2
+  exit 1
+}
+
+# =============================================================================
+# The steps that keep this path and the unattended one the same
+# =============================================================================
+
+# `sudo ./scripts/install.sh` is a natural thing to type for a script visibly
+# full of sudo, and nothing used to stop it. It does not fail - it produces a
+# box that plays television and quietly cannot do anything else: the venv, the
+# editable install, config.yaml and the generated filler clips all owned by
+# root, while the units render with User= the human. The dashboard then cannot
+# save a setting, the self-updater fails both its writability gate and git's
+# own "dubious ownership" refusal, and the OSD font lands in /root.
+#
+#   $1 our uid   $2 SUDO_USER   $3 HOME   $4 the home SUDO_USER really has
+#
+# installer/provision.sh is also root with SUDO_USER set, deliberately, and
+# injects HOME so the font and the caches land in the box account's home. That
+# is what tells the two apart: the mistake carries root's HOME, the build does
+# not.
+refuse_a_root_install() {
+  local uid="$1" sudo_user="$2" home="$3" expected_home="$4"
+  [[ "${uid}" == "0" ]] || return 0
+  [[ -n "${sudo_user}" && "${sudo_user}" != "root" ]] || return 0
+  [[ -n "${expected_home}" ]] || return 0
+  [[ "${home}" != "${expected_home}" ]] || return 0
+  fail \
+    "error: this is running as root on behalf of '${sudo_user}', with root's" \
+    "       home directory. That builds a box '${sudo_user}' does not own." \
+    "" \
+    "  Everything below - the virtual environment, config.yaml, the generated" \
+    "  filler clips, the OSD font - would belong to root, while the two service" \
+    "  units run as '${sudo_user}'. The television would play, and then the" \
+    "  dashboard could not save a single setting, the self-updater would refuse" \
+    "  to run, and none of it would be reported anywhere." \
+    "" \
+    "  Run it as '${sudo_user}', without sudo:" \
+    "    ./scripts/install.sh" \
+    "" \
+    "  It asks for sudo itself where it needs root. Nothing has been changed."
+}
+
+# The library folder, and something for a brand-new box to play out of it.
+#
+#   $1 the media root   $2 the account   $3 its group   $4 the splash clip
+#
+# provision.sh has always done this. Here, the only thing that ever created the
+# media root was scripts/setup_lan_share.sh - so `--no-share` produced a box
+# with no library at all, and so did a share that failed for any other reason,
+# because install.sh swallowed that failure and printed "Done!" underneath it.
+#
+# .welcome is deliberately a DOT folder: auto_channels skips hidden folders, so
+# the placeholder channel can point at it without being rediscovered and
+# duplicated on every start-up.
+ensure_media_library() {
+  local media="$1" user="$2" group="$3" splash="$4"
+  sudo mkdir -p "${media}/.welcome"
+  if [[ -f "${splash}" && ! -f "${media}/.welcome/${splash##*/}" ]]; then
+    # So a box with nothing on it yet shows the JV Projects splash instead of
+    # colour bars.
+    sudo cp "${splash}" "${media}/.welcome/"
+  fi
+  # Recursive, and with the group named: the share's own chown was neither, so
+  # the folder stayed group-root and files written into it by one route were
+  # not readable by the other.
+  sudo chown -R "${user}:${group}" "${media}"
+  echo "    ${media} is ready (owned by ${user}:${group})"
+}
+
+# The config a box starts life with.
+#
+# This used to be `cp config.example.yaml config.yaml`, and that file is a
+# reference for every option the box has - not a starting lineup. It leaves
+# media_root unset and auto_channels off, with five explicit channels pointing
+# at folders that do not exist. The consequences are all customer-facing: the
+# README's "anything dropped in lands in ${MEDIA_ROOT}" is simply untrue, the
+# dashboard's upload page returns HTTP 400 "set media_root in config.yaml", and
+# the television shows five channels of nothing.
+#
+# The shape below is provision.sh's, and the explicit channel in it is not
+# redundant. With media_root set and NO channels key, a brand-new box with an
+# empty library raises "no channels found" and exits 2; retrobox.service then
+# fails five times in fifteen seconds, hits StartLimitBurst and goes PERMANENTLY
+# dead, and dropping media in later does not bring it back. An explicit channel
+# never touches the filesystem when it parses, so the box always comes up.
+write_starter_config() {
+  local path="$1" media="$2"
+  if [[ -f "${path}" ]]; then
+    echo "    ${path} already exists - leaving it alone"
+    return 0
+  fi
+  cat > "${path}" <<YAML
+# Written by scripts/install.sh. Safe to edit, and the dashboard rewrites parts
+# of it. Every option the box has is documented in config.example.yaml.
+#
+# Drop a folder of videos into ${media} (or into \\\\retrobox\\Library from a PC)
+# and it becomes a channel on the next start-up.
+media_root: ${media}
+auto_channels: true
+
+# Channel 2 is a placeholder so the box always has a valid lineup, even with an
+# empty library. Discovered channels are numbered from 3 upwards. Delete this
+# entry once the box has real content.
+channels:
+  - number: 2
+    name: "Retro Box"
+    path: ${media}/.welcome
+YAML
+  echo "    wrote ${path}"
+}
+
+# `retrobox --check` is three-valued and it was being read as two-valued.
+#
+#   2 = the config is broken and the television will not start
+#   1 = the config is fine, there is no media yet   <- a new box, every time
+#   0 = fine, with media
+#
+# Every non-zero exit used to be swallowed into a friendly hint, and the script
+# went on to install AND START the service and print "Done!". On exit 2 that is
+# a unit that burns its five restarts in about fifteen seconds and stays dead
+# for ever - the exact black-screen failure with no SSH behind it that the
+# unattended installer refuses to ship.
+validate_config() {
+  local checker="$1" config="$2" rc=0
+  "${checker}" --check --config "${config}" || rc=$?
+  case "${rc}" in
+    0) echo "    config OK, and the library already has content" ;;
+    1) echo "    config OK - no media yet, which is expected on a new box" ;;
+    *)
+      fail \
+        "error: ${config} is not a config the television can start with" \
+        "       (retrobox --check exited ${rc})." \
+        "" \
+        "  The reason is printed above this message. Nothing has been started" \
+        "  and no service has been installed - deliberately: a unit given a" \
+        "  config it refuses gives up after five failed starts in a minute and" \
+        "  stays dead until somebody clears it by hand, which on a box with no" \
+        "  keyboard and no SSH means it never comes back." \
+        "" \
+        "  Fix it and run this script again:" \
+        "    retrobox --setup                 # build a lineup interactively" \
+        "    \$EDITOR ${config}                # or edit it by hand"
+      ;;
+  esac
+}
+
+# Nothing on this box may wait for a network it has not got.
+#
+# This is the most visible failure the product has and the one nobody who
+# installs it ever sees. installer/harden-boot.sh has always been run by the
+# unattended build and never by this one - while THIS script is what installs
+# and enables smbd and wsdd, whose Ubuntu packaging is exactly what drags
+# systemd-networkd-wait-online into every boot transaction. The customer
+# unplugs the box, carries it to a friend's house, switches it on with no cable
+# in it, and watches a red "A start job is running for Wait for Network to be
+# Configured" count to 2min on the television they bought the box for.
+#
+#   $1 the harden-boot.sh script   $2 the root to act on (default /)
+harden_boot() {
+  local script="$1" root="${2:-/}"
+  if [[ ! -f "${script}" ]]; then
+    fail \
+      "error: ${script} is missing, so nothing has stopped this box waiting" \
+      "       for a network at boot." \
+      "" \
+      "  Every cold start would show 'A start job is running for Wait for" \
+      "  Network to be Configured' counting to two minutes on the television" \
+      "  before any picture appears." \
+      "" \
+      "  It is part of this repository: check the clone is complete" \
+      "  (git status) and run this script again."
+  fi
+  if [[ "${root}" == "/" ]]; then
+    sudo bash "${script}" || fail \
+      "error: ${script} failed, so this box may still wait for a network at" \
+      "       boot. What it said is above." \
+      "" \
+      "  Fix that and run this script again, or run it on its own:" \
+      "    sudo ./installer/harden-boot.sh"
+  else
+    sudo bash "${script}" --root "${root}" || fail \
+      "error: ${script} failed against ${root}. What it said is above."
+  fi
+  verify_no_wait_for_network "${root}"
+}
+
+# Asked rather than assumed, exactly as provision.sh asks it. A mask IS a
+# symlink to /dev/null, so this is the real question: could this unit still be
+# loaded and pulled into a boot?
+verify_no_wait_for_network() {
+  local root="${1:-/}" unit link
+  for unit in systemd-networkd-wait-online.service \
+              NetworkManager-wait-online.service; do
+    link="${root%/}/etc/systemd/system/${unit}"
+    if [[ -L "${link}" && "$(readlink "${link}")" == "/dev/null" ]]; then
+      continue
+    fi
+    fail \
+      "error: ${unit} is not masked." \
+      "" \
+      "  With nothing plugged in, this box counts a red 'Wait for Network to be" \
+      "  Configured' job up to two minutes on the customer's television, on" \
+      "  every boot, for ever - and the picture only appears after it gives up." \
+      "" \
+      "  Try it directly and read what it says:" \
+      "    sudo ./installer/harden-boot.sh" \
+      "  then run this script again."
+  done
+  echo "    checked: nothing on this box waits for a network at boot"
+}
+
+# Where the dashboard is, in the two places somebody will actually look.
+#
+# A manual-path box greeted anybody who plugged a keyboard into it with a bare
+# "retrobox login:" and no hint that a dashboard exists, let alone its address.
+# agetty expands \4 to the current IPv4 address at DISPLAY time, so the console
+# banner stays right across DHCP leases without anything rewriting it.
+#
+#   $1 the /etc to write into (a real path here, a throwaway one in the tests)
+write_console_banners() {
+  local etc="${1:-/etc}"
+  sudo mkdir -p "${etc}/update-motd.d"
+  printf '%s\n' \
+    'Retro Box - JV Projects' \
+    '' \
+    '  Dashboard : http://retrobox.local/   or   http://\4/' \
+    '  Library   : \\retrobox\Library   (drag video folders in from any PC)' \
+    '  TV        : systemctl status retrobox' \
+    '' | sudo tee "${etc}/issue" > /dev/null
+  sudo tee "${etc}/update-motd.d/99-retrobox" > /dev/null <<'MOTD'
+#!/bin/sh
+# Installed by scripts/install.sh.
+ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+printf '\n Retro Box - JV Projects\n\n'
+printf '   Dashboard : http://retrobox.local/'
+[ -n "$ip" ] && printf '   or   http://%s/' "$ip"
+printf '\n   Library   : \\\\retrobox\\Library\n'
+printf '   TV        : systemctl status retrobox\n\n'
+MOTD
+  sudo chmod 0755 "${etc}/update-motd.d/99-retrobox"
+  echo "    the console and the SSH banner now say where the dashboard is"
+}
+
+# The last thing anybody reads, and it used to be wrong in the one case that
+# matters: somebody who had just run `./scripts/install.sh --service`, exactly
+# as the README tells them to, finished with "Auto-start on boot:
+# ./scripts/install.sh --service" - an instruction to redo what they had just
+# done - and was pointed at a way of adding channels that does not work.
+#
+#   $1 platform   $2 1 if the service was installed   $3 media root   $4 repo
+closing_notes() {
+  local platform="$1" service="$2" media="$3" repo="$4"
+  local readonly_help
+  if [[ "${platform}" == "pi" ]]; then
+    readonly_help="  sudo raspi-config  ->  Performance Options  ->  Overlay File System"
+  else
+    readonly_help="  sudo apt install overlayroot, then set 'overlayroot=tmpfs' in /etc/overlayroot.conf"
+  fi
+
+  if [[ "${service}" == "1" ]]; then
+    cat <<EOF
+
+==> Done! The box is installed and running.
+
+  Television : on the HDMI output, now and on every boot
+  Dashboard  : http://retrobox.local/
+  Library    : \\\\retrobox\\Library from any PC, or ${media} on the box
+               drop a folder of videos in - it becomes a channel
+
+  systemctl status retrobox     # is it running?
+  journalctl -u retrobox -f     # live logs
+EOF
+  else
+    cat <<EOF
+
+==> Done! Nothing starts on its own yet.
+
+Next steps:
+  1. Drop a folder of videos into ${media} - it becomes a channel.
+     (Fine-tune the lineup with 'retrobox --setup', or edit
+     ${repo}/config.yaml by hand.)
+  2. Test it:   retrobox --check
+                retrobox                 # starts the TV
+  3. Boot straight into TV mode, with the dashboard on
+     http://retrobox.local/ :
+       ./scripts/install.sh --service
+EOF
+  fi
+
+  cat <<EOF
+
+Optional - make the root filesystem read-only so a power cut can never
+corrupt it (${platform}):
+${readonly_help}
+
+Enjoy your nostalgia box!
+EOF
+}
+
+# tests/test_install_parity.py sources this file for the functions above and
+# runs them against throwaway directories with a stand-in sudo, because none of
+# this can be installed on a laptop. Nothing else sets this.
+if [[ "${RETROBOX_INSTALL_LIB_ONLY:-}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+# =============================================================================
+# Installing
+# =============================================================================
+RUN_USER="${SUDO_USER:-$USER}"
+# Looked up, not assumed to match the user's name: Debian usually creates a
+# matching per-user group and does not always, and everything this script
+# chowns is chowned to it.
+if ! RUN_GROUP="$(id -gn "${RUN_USER}" 2> /dev/null)" || [[ -z "${RUN_GROUP}" ]]; then
+  fail \
+    "error: '${RUN_USER}' is not an account on this box, so there is nobody to" \
+    "       install it for." \
+    "" \
+    "  Run this as the account the box will run as (check with: id)." \
+    "  Nothing has been changed."
+fi
+RUN_HOME=""
+if [[ -n "${SUDO_USER:-}" ]]; then
+  RUN_HOME="$(getent passwd "${SUDO_USER}" | cut -d: -f6 || true)"
+fi
+refuse_a_root_install "$(id -u)" "${SUDO_USER:-}" "${HOME:-}" "${RUN_HOME}"
 
 # --- Which machine is this? --------------------------------------------------
 # The device tree model is the reliable Pi tell; everything else is treated as
@@ -196,15 +544,33 @@ if systemctl list-unit-files 2>/dev/null | grep -q "^avahi-daemon\.service"; the
   fi
 fi
 
+# The library itself, BEFORE the share and regardless of it. The share is a
+# convenience; the folder the channels are scanned from is not.
+echo "==> Creating the media library at ${MEDIA_ROOT}"
+ensure_media_library "${MEDIA_ROOT}" "${RUN_USER}" "${RUN_GROUP}" \
+  "${REPO_DIR}/retrobox/assets/boot_splash.mp4"
+
 if [[ "${SETUP_SHARE}" -eq 1 ]]; then
   echo "==> Setting up the LAN file share"
   # Every unit wants this, so it is part of the standard flow rather than a
   # manual step afterwards. Pass --no-share to skip it.
-  "${REPO_DIR}/scripts/setup_lan_share.sh" || \
+  #
+  # --path, so the folder shared as \\retrobox\Library is the folder the
+  # channels are scanned from. Without it the share fell back to its own
+  # hard-coded default, and a box built with RETROBOX_MEDIA_ROOT elsewhere
+  # shared an empty directory: shows copied in over the network, successfully,
+  # to a place nothing ever reads.
+  "${REPO_DIR}/scripts/setup_lan_share.sh" --path "${MEDIA_ROOT}" || \
     echo "   (LAN share setup failed - the TV still works; re-run scripts/setup_lan_share.sh)"
 else
   echo "==> Skipping the LAN file share (--no-share)"
 fi
+
+# Deliberately after the share: the units that pull network-online.target into
+# the boot are smbd and wsdd, and this cleans up after whatever just enabled
+# them.
+echo "==> Making sure nothing on this box waits for a network at boot"
+harden_boot "${REPO_DIR}/installer/harden-boot.sh"
 
 echo "==> Generating filler assets (static, glitch + colour bars)"
 python -m retrobox.static_gen || echo "   (asset generation skipped/failed - box still works)"
@@ -221,42 +587,31 @@ if compgen -G "${REPO_DIR}/retrobox/assets/fonts/*.ttf" > /dev/null; then
   fi
 fi
 
-if [[ ! -f "${REPO_DIR}/config.yaml" ]]; then
-  echo "==> Creating a starter config.yaml (or run: retrobox --setup)"
-  cp "${REPO_DIR}/config.example.yaml" "${REPO_DIR}/config.yaml"
-fi
+echo "==> Making sure there is a config.yaml to start from"
+write_starter_config "${REPO_DIR}/config.yaml" "${MEDIA_ROOT}"
 
 echo "==> Validating configuration"
-retrobox --check --config "${REPO_DIR}/config.yaml" || \
-  echo "   (run 'retrobox --setup' to build one interactively)"
+validate_config "${REPO_DIR}/.venv/bin/retrobox" "${REPO_DIR}/config.yaml"
+
+# The size of the disk is the one number a customer checks, and Ubuntu's guided
+# LVM default leaves roughly half of it unallocated where nothing reports it:
+# measured on hardware, a 128 GB box came up with 57 GB usable and 58 GB idle.
+#
+# AUDITED ONLY, deliberately. The unattended installer grows the filesystem
+# because it partitioned that disk itself moments earlier. This script is run on
+# a machine somebody else set up, and quietly resizing their volumes is not
+# ours to do - so it reports, in the words that say what to run.
+echo "==> Checking the root filesystem owns the whole disk"
+sudo "${REPO_DIR}/installer/storage-grow.sh" --audit-only || \
+  echo "   (the disk check did not pass - read the block above; to claim the" \
+       "rest of the disk: sudo ./installer/storage-grow.sh)"
+
+echo "==> Saying where the dashboard is, on the console and over SSH"
+write_console_banners /etc
 
 if [[ "${INSTALL_SERVICE}" -eq 1 ]]; then
   echo "==> Installing systemd service"
   "${REPO_DIR}/scripts/install-service.sh"
 fi
 
-# --- Platform-appropriate closing notes --------------------------------------
-if [[ "${PLATFORM}" == "pi" ]]; then
-  READONLY_HELP="  sudo raspi-config  ->  Performance Options  ->  Overlay File System"
-else
-  READONLY_HELP="  sudo apt install overlayroot, then set 'overlayroot=tmpfs' in /etc/overlayroot.conf"
-fi
-
-cat <<EOF
-
-==> Done!
-
-Next steps:
-  1. Build your channel lineup:   retrobox --setup
-     (or edit ${REPO_DIR}/config.yaml by hand)
-  2. Copy your video files onto the box (e.g. /media/retrobox/<channel>/).
-  3. Test it:   retrobox --check
-                retrobox                 # starts the TV
-  4. Auto-start on boot:   ./scripts/install.sh --service
-
-Optional - make the root filesystem read-only so a power cut can never
-corrupt it (${PLATFORM}):
-${READONLY_HELP}
-
-Enjoy your nostalgia box!
-EOF
+closing_notes "${PLATFORM}" "${INSTALL_SERVICE}" "${MEDIA_ROOT}" "${REPO_DIR}"

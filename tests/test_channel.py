@@ -263,3 +263,52 @@ def test_shuffle_false_keeps_broadcast_order(tmp_path):
         paths, [100.0] * 4, epoch=0.0, rng=random.Random(1), shuffle=False
     )
     assert [schedule.at(t).path for t in (0, 100, 200, 300)] == paths
+
+
+# ==========================================================================
+# Hidden FOLDERS, not just hidden files
+# ==========================================================================
+def test_a_channel_pointed_at_the_library_root_does_not_air_the_trash(tmp_path):
+    """Deleting an episode must not put it back on the air.
+
+    The dashboard's delete moves a file into `.retrobox-trash` inside the media
+    library rather than unlinking it, so an owner has a fortnight to change
+    their mind. That only works if the trash is invisible to scanning.
+
+    The dot-prefix was assumed to cover it. It did not: the check was on the
+    FILE name, and `rglob` walks straight into a dot-folder, so a channel whose
+    path is the library root itself picked the trashed episode back up and
+    aired it. Nothing the box creates makes such a channel, but a person can
+    write one by hand - and a customer watching an episode they deleted last
+    week would have no idea why.
+    """
+    root = tmp_path / "library"
+    (root / "shows").mkdir(parents=True)
+    (root / "shows" / "ep1.mp4").write_bytes(b"x")
+    trashed = root / ".retrobox-trash" / "abc" / "payload"
+    trashed.mkdir(parents=True)
+    (trashed / "deleted.mp4").write_bytes(b"x")
+
+    found = scan_episodes(root, (".mp4",))
+
+    assert (root / "shows" / "ep1.mp4") in found
+    assert not [p for p in found if ".retrobox-trash" in p.parts], (
+        "a trashed episode is still on the air: " + str(found)
+    )
+
+
+def test_the_shipped_welcome_clip_still_plays(tmp_path):
+    """The guard above must not break a fresh box.
+
+    The installer seeds `<media>/.welcome` with the boot splash so a box with no
+    library yet still has something to show, and points a channel straight at
+    that folder (installer/provision.sh). The folder is dot-prefixed on purpose,
+    to keep it out of auto-discovery - so the hidden-folder rule has to be
+    relative to the folder being scanned, not absolute, or the placeholder stops
+    playing on every new box.
+    """
+    welcome = tmp_path / "media" / ".welcome"
+    welcome.mkdir(parents=True)
+    (welcome / "boot_splash.mp4").write_bytes(b"x")
+
+    assert scan_episodes(welcome, (".mp4",)) == [welcome / "boot_splash.mp4"]

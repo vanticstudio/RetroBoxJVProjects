@@ -18,11 +18,13 @@ class Runner:
 
     def __init__(self):
         self.calls = []
+        self.where = []            # the cwd each call was made in
         self.fail_on = {}          # first word of argv -> (code, output)
         self.answers = {}
 
     def __call__(self, cmd, **kw):
         self.calls.append(list(cmd))
+        self.where.append(kw.get("cwd"))
         key = self._key(cmd)
         if key in self.fail_on:
             return self.fail_on[key]
@@ -32,11 +34,41 @@ class Runner:
     def _key(cmd):
         parts = [p for p in cmd if not p.startswith("-")]
         if parts and parts[0].endswith("python"):
-            return "pip"
+            # The updater runs the venv's python for two quite different
+            # things: `-m pip` to install the new code, and `-m
+            # retrobox.updater --privileges` to ask that new code whether this
+            # box may still run its own privileged commands. A test has to be
+            # able to fail one of those without failing the other.
+            return "pip" if "pip" in cmd else "privileges"
         return " ".join(parts[:2]) if len(parts) > 1 else (parts[0] if parts else "")
 
     def ran(self, needle):
         return [c for c in self.calls if needle in " ".join(c)]
+
+    def at(self, needle):
+        """Where in the sequence of calls something happened, first and last."""
+        found = [i for i, c in enumerate(self.calls) if needle in " ".join(c)]
+        return found
+
+
+def privileges_answer(state="ok", **extra):
+    """What ``python -m retrobox.updater --privileges`` prints.
+
+    A healthy box by default, which is what almost every test here wants: the
+    permission the installer wrote still covers everything the new code runs.
+    """
+    answer = {
+        "state": state,
+        "applied": False,
+        "headline": "This box can look after itself",
+        "message": "",
+        "affected": [],
+        "refused": [],
+        "detail": "",
+        "command": "cd /home/retrobox/RetroBox && ./scripts/install-service.sh",
+    }
+    answer.update(extra)
+    return json.dumps(answer)
 
 
 class Clock:
@@ -61,6 +93,11 @@ def repo(tmp_path):
 def runner():
     r = Runner()
     r.answers["git describe"] = "v1.0.3"
+    # A box whose permission still covers what the new code runs, which is the
+    # ordinary case. Set here for the same reason "git describe" is: it is what
+    # the real command answers on a healthy box, and a test about something
+    # else should not have to know that the updater asks.
+    r.answers["privileges"] = privileges_answer()
     return r
 
 
@@ -238,6 +275,470 @@ def test_the_message_after_a_rollback_says_the_box_is_working(repo, runner):
 
 
 # ==========================================================================
+# The permission the new code needs, which nothing used to put back
+# ==========================================================================
+# This is the failure that has not happened yet and arrives at every unit at
+# once. servicectl.COMMANDS is the closed list of things this box may do as
+# root, and the sudoers fragment is generated from it - by the installer, on
+# the day the box was set up, and by nothing else since. The first release that
+# adds a privileged action therefore reaches a field full of boxes running new
+# code against a grant written for the old table: the update reports success,
+# the television keeps playing, and the new button silently does nothing on
+# every unit simultaneously, with nobody able to SSH in and find out why.
+def test_an_update_puts_the_permission_back_in_step_before_it_restarts_anything(
+    repo, runner, healthy
+):
+    updater = make(repo, runner, healthy)
+    updater.apply("1.1.0")
+
+    asked = runner.at("--privileges")
+    assert asked, (
+        "the update never regenerated or checked this box's sudo permission. "
+        "servicectl.COMMANDS grows, and the fragment on disk was generated "
+        "from whatever that table said on the day the installer last ran - so "
+        "without this step a release that adds a privileged action ships a "
+        "dead button to every box in the field at once."
+    )
+
+    installed = runner.at("install -e") or [
+        i for i, c in enumerate(runner.calls) if Runner._key(c) == "pip"
+    ]
+    restarted = runner.at("systemctl")
+    assert max(installed) < asked[0], (
+        "the permission was worked out before the new code was installed, so "
+        "it was generated from the OLD command table - which is the bug"
+    )
+    assert asked[0] < min(restarted), (
+        "the television was restarted into a version this box has not been "
+        "given permission to run"
+    )
+
+
+def test_the_permission_is_asked_of_the_new_code_not_of_the_running_process(
+    repo, runner, healthy
+):
+    # The dashboard process doing the update imported retrobox.servicectl when
+    # it started, months ago, and that module object is the OLD command table -
+    # re-importing it under a live dashboard is not something this can do. So
+    # the question has to be put to a fresh interpreter, running the code that
+    # was just checked out, out of the box's own venv.
+    updater = make(repo, runner, healthy)
+    updater.apply("1.1.0")
+
+    asked = runner.at("--privileges")
+    argv = runner.calls[asked[0]]
+    assert argv[0] == str(repo / ".venv" / "bin" / "python"), (
+        f"it asked {argv[0]} rather than the box's own venv"
+    )
+    assert argv[1:] == ["-m", "retrobox.updater", "--privileges"]
+    assert runner.where[asked[0]] == repo
+
+
+def test_an_update_the_box_has_not_been_given_permission_for_is_rolled_back(
+    repo, runner, healthy
+):
+    # "stale" is the shape this arrives in: the older, smaller grant covers
+    # most of what the box does, so almost everything works and one page does
+    # not. Left alone that is weeks of a customer pressing a button that does
+    # nothing.
+    runner.answers["privileges"] = privileges_answer(
+        "stale",
+        headline="This box's permission is out of date",
+        affected=["saving network settings"],
+    )
+    updater = make(repo, runner, healthy)
+
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+
+    assert any("v1.0.3" in " ".join(c) for c in runner.ran("reset")), (
+        "it left the box on a version half its dashboard cannot drive"
+    )
+    assert updater.state()["phase"] == "rolled_back"
+
+
+def test_a_version_that_was_never_granted_anything_is_rolled_back_too(
+    repo, runner, healthy
+):
+    runner.answers["privileges"] = privileges_answer("missing")
+    updater = make(repo, runner, healthy)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+    assert updater.state()["phase"] == "rolled_back"
+
+
+def test_the_television_is_never_restarted_into_a_version_that_cannot_be_granted(
+    repo, runner, healthy
+):
+    # The picture going off is the most alarming thing this box does. There is
+    # no reason to put a customer through it for a version that is about to be
+    # taken away again.
+    runner.answers["privileges"] = privileges_answer("stale")
+    updater = make(repo, runner, healthy)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+
+    asked = runner.at("--privileges")[0]
+    reset = runner.at("reset")[0]
+    restarts = runner.at("systemctl")
+    assert all(index > reset for index in restarts), (
+        "it restarted the television into the new version and only then found "
+        "out the box may not run it"
+    )
+    assert asked < reset
+
+
+def test_a_rolled_back_update_tells_the_owner_the_one_command_that_fixes_it(
+    repo, runner, healthy
+):
+    # An owner who is told only "the update did not work" tries it again, and
+    # again, for ever. The fix is one line typed on the box, and it is the only
+    # thing the dashboard is allowed to do about this: a rule that let an
+    # unauthenticated page write sudo's own configuration would hand the box to
+    # anyone on the home network.
+    runner.answers["privileges"] = privileges_answer(
+        "stale", command="cd /home/retrobox/RetroBox && ./scripts/install-service.sh",
+    )
+    updater = make(repo, runner, healthy)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+
+    message = updater.state()["message"]
+    assert "install-service.sh" in message, (
+        f"nothing in this tells the owner what to do:\n{message}"
+    )
+    assert "1.0.3" in message, "it never says which version the box is on now"
+    assert "sudo" not in message.lower(), (
+        "the word sudo means nothing to somebody looking at a television"
+    )
+
+
+def test_a_permission_answer_that_never_arrives_is_treated_as_a_failed_update(
+    repo, runner, healthy
+):
+    # A box that cannot answer the question has not answered it "yes". Going
+    # on regardless is exactly the bug: an update that reports success and
+    # leaves a dashboard that half works. Stopping and putting the old version
+    # back leaves a box that works and says why.
+    runner.fail_on["privileges"] = (1, "ModuleNotFoundError: No module named 'retrobox'")
+    updater = make(repo, runner, healthy)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+    assert updater.state()["phase"] == "rolled_back"
+
+
+def test_a_reply_that_is_not_an_answer_is_not_taken_for_a_yes(repo, runner, healthy):
+    runner.answers["privileges"] = "Traceback (most recent call last):"
+    updater = make(repo, runner, healthy)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+    assert updater.state()["phase"] == "rolled_back"
+
+
+def test_a_state_this_version_has_never_heard_of_is_not_taken_for_a_yes(
+    repo, runner, healthy
+):
+    # The answer comes from the NEW code, so it can say something this version
+    # does not recognise. Anything that is not plainly "yes" has to fail shut.
+    runner.answers["privileges"] = privileges_answer("something-invented-later")
+    updater = make(repo, runner, healthy)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+    assert updater.state()["phase"] == "rolled_back"
+
+
+def test_a_fault_that_undoing_the_update_cannot_fix_does_not_undo_the_update(
+    repo, runner, healthy
+):
+    """"blocked" is sudo unable to become root at all, whatever the rules say.
+
+    That is the NoNewPrivileges= shape, it is a property of the unit file the
+    dashboard is *already* running under - the update has not restarted
+    anything yet when this is asked - and the previous version is every bit as
+    blocked as the new one. Rolling back would cost the customer their update
+    and fix nothing. So the update goes through and the fault is recorded and
+    logged, because it is real and it needs a different fix.
+    """
+    runner.answers["privileges"] = privileges_answer("blocked")
+    updater = make(repo, runner, healthy)
+    updater.apply("1.1.0")
+
+    assert updater.state()["phase"] == "probation", (
+        "it undid a working update for a fault undoing it cannot touch"
+    )
+    assert updater.state()["privileges"] == "blocked"
+
+
+def test_the_owner_is_never_shown_sudos_own_words_or_a_path_out_of_etc(
+    repo, runner, healthy
+):
+    # The state file is served to the browser as-is by the dashboard's update
+    # panel, so anything written into it is on a page. "sudo: interactive
+    # authentication is required" and /etc/sudoers.d are for the journal.
+    runner.answers["privileges"] = privileges_answer(
+        "stale",
+        refused=["/usr/bin/systemctl --no-block restart retrobox-web.service"],
+        detail="1 of 21 commands refused; /etc/sudoers.d/retrobox-system is unknown",
+    )
+    updater = make(repo, runner, healthy)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+
+    written = (repo / ".retrobox-update.json").read_text()
+    for leak in ("sudoers.d", "/usr/bin/systemctl", "commands refused"):
+        assert leak not in written, f"{leak!r} reached a page a customer reads"
+
+
+def test_a_rollback_puts_the_permission_back_in_step_with_the_code_it_leaves_behind(
+    repo, runner, healthy
+):
+    """A box left on old code with a new, wider grant is a security regression.
+
+    Only root can rewrite the fragment, so on a shipped box nothing is ever
+    written and there is nothing to undo. But the updater is also run by hand
+    as root, and a box switched off at the wall mid-update finishes the job at
+    the next start-up - and in both of those the fragment may have been
+    regenerated from the new command table before the update failed. Whatever
+    version the box actually ends up running, the grant has to match it, which
+    means asking again after the old code is back.
+    """
+    runner.fail_on["pip"] = (1, "could not build wheel")
+    updater = make(repo, runner, healthy)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+
+    reset = runner.at("reset")[0]
+    asked = [index for index in runner.at("--privileges") if index > reset]
+    assert asked, (
+        "the rollback left this box's sudo permission generated from the "
+        "version it just took away - a grant wider than the code it is now "
+        "running needs"
+    )
+
+
+def test_the_rule_the_update_puts_back_is_generated_from_todays_command_table(
+    monkeypatch, tmp_path
+):
+    """The tripwire for the release that adds a privileged action.
+
+    Every other test here drives a stand-in for the subprocess. This one runs
+    the real thing against a stand-in /etc/sudoers.d, with a fragment on it
+    generated from a command table one entry short - which is precisely what a
+    box set up by an earlier version has, and precisely what the box this bug
+    was found on had.
+
+    If it fails, what has been forgotten is that ``servicectl.COMMANDS`` is
+    the source of the sudoers fragment as well as of the commands, and that
+    something in the update path has to regenerate it. A box that updates its
+    code and keeps the grant the installer wrote months ago gets a button that
+    silently does nothing, on every unit in the field on the same day.
+    """
+    from retrobox import servicectl
+    from retrobox import updater as updater_module
+
+    user = "retrobox"
+    assert len(servicectl.COMMANDS) > 1
+
+    # What a box set up by an earlier version has on disk: the same generator,
+    # run against a command table with one entry missing.
+    older = dict(servicectl.COMMANDS)
+    older.pop(next(iter(older)))
+    monkeypatch.setattr(servicectl, "COMMANDS", older)
+    stale_rule = servicectl.sudoers_rule(user)
+    monkeypatch.undo()
+
+    wanted = servicectl.sudoers_rule(user)
+    assert stale_rule != wanted, (
+        "dropping a command from COMMANDS no longer changes the generated "
+        "rule, so this test can no longer tell a stale grant from a current one"
+    )
+
+    sudoers = tmp_path / "sudoers.d"
+    sudoers.mkdir()
+    target = sudoers / "retrobox-system"
+    target.write_text(stale_rule, encoding="utf-8")
+
+    # A box where this process is root, visudo is happy, and no privileged
+    # command exists to be probed - so nothing runs sudo and nothing runs.
+    monkeypatch.setattr(servicectl, "SUDOERS_PATH", str(target))
+    monkeypatch.setattr(servicectl, "_am_root", lambda: True)
+    monkeypatch.setattr(servicectl, "current_user", lambda: user)
+    monkeypatch.setattr(
+        servicectl, "_first_existing",
+        lambda paths: "/usr/bin/visudo" if paths is servicectl._VISUDO_PATHS else None,
+    )
+    monkeypatch.setattr(servicectl, "_run", lambda cmd, **kw: (0, ""))
+
+    answer = updater_module.refresh_privileges()
+
+    assert target.read_text(encoding="utf-8") == wanted, (
+        "the update path did not regenerate /etc/sudoers.d/retrobox-system "
+        "from today's servicectl.COMMANDS. Whoever added a privileged command "
+        "also has to make sure the update regenerates the rule - the "
+        "installer writes it once, on the day the box is set up, and nothing "
+        "else ever has."
+    )
+    assert answer["applied"] is True
+
+
+def test_asking_about_the_permission_never_runs_any_of_the_commands_it_asks_about(
+    monkeypatch, tmp_path
+):
+    # An installer that proved the reboot button worked by rebooting the box
+    # would be its own bug report. The same goes for an update.
+    from retrobox import servicectl
+    from retrobox import updater as updater_module
+
+    ran = []
+
+    def watch(cmd, **kw):
+        ran.append(list(cmd))
+        return (0, "")
+
+    monkeypatch.setattr(servicectl, "_run", watch)
+    monkeypatch.setattr(servicectl, "_am_root", lambda: False)
+    updater_module.refresh_privileges()
+
+    for call in ran:
+        assert "-l" in call, f"{' '.join(call)} was run, not asked about"
+
+
+def test_the_privileges_answer_is_one_line_of_json_on_its_own(capsys, monkeypatch):
+    # It is read back by a process that has only the exit status and the
+    # output to go on. Anything else on stdout makes it unreadable.
+    from retrobox import servicectl
+    from retrobox import updater as updater_module
+
+    # No real sudo. This runs on a laptop, and asking the developer's own
+    # machine about its sudo rules is not this test's business.
+    monkeypatch.setattr(servicectl, "_run", lambda cmd, **kw: (0, ""))
+    monkeypatch.setattr(servicectl, "_am_root", lambda: False)
+
+    assert updater_module.main(["--privileges"]) == 0
+    printed = capsys.readouterr().out.strip().splitlines()
+    assert len(printed) == 1, printed
+    answer = json.loads(printed[0])
+    assert set(answer) >= {"state", "applied", "message", "command"}
+
+
+# ==========================================================================
+# A rollback that says it worked has to have worked
+# ==========================================================================
+def test_a_rollback_whose_reset_failed_does_not_say_the_box_is_working_normally(
+    repo, runner
+):
+    # This is read off a television by somebody deciding whether the box can be
+    # left alone until the morning. If the old files never went back, it can
+    # not, and telling them it can is worse than telling them nothing.
+    runner.fail_on["git reset"] = (1, "fatal: could not write .git/index")
+    updater = make(repo, runner, healthy=lambda timeout: False)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+
+    message = updater.state()["message"]
+    assert "working normally" not in message.lower(), message
+    assert updater.state()["rollback_complete"] is False
+
+
+def test_a_rollback_whose_reinstall_failed_says_so(repo, runner):
+    # Old files with the new version's dependencies in the venv is its own
+    # broken state, and it is not one the owner can see from the outside.
+    runner.fail_on["pip"] = (1, "no matching distribution")
+    updater = make(repo, runner, healthy=lambda timeout: False)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+
+    assert updater.state()["rollback_complete"] is False
+    assert "working normally" not in updater.state()["message"].lower()
+
+
+def test_a_rollback_whose_restart_failed_says_so(repo, runner):
+    runner.fail_on["sudo systemctl"] = (1, "Failed to restart retrobox.service")
+    updater = make(repo, runner, healthy=lambda timeout: False)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+
+    assert updater.state()["rollback_complete"] is False
+    assert "working normally" not in updater.state()["message"].lower()
+
+
+def test_a_rollback_that_did_work_still_says_the_box_is_fine(repo, runner):
+    # The other half of the same promise: this wording is the reassuring one
+    # and it has to keep being available for the case where it is true.
+    updater = make(repo, runner, healthy=lambda timeout: False)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+
+    assert updater.state()["rollback_complete"] is True
+    assert "nothing was lost" in updater.state()["message"]
+
+
+def test_a_rollback_that_could_not_finish_tells_the_owner_what_to_try(repo, runner):
+    # The one thing an owner of this box can actually do is switch it off and
+    # on again at the wall, and that genuinely does finish an interrupted
+    # rollback - the next start-up picks the job back up.
+    runner.fail_on["git reset"] = (1, "fatal: could not write .git/index")
+    updater = make(repo, runner, healthy=lambda timeout: False)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+
+    message = updater.state()["message"].lower()
+    assert "off" in message and "on" in message, updater.state()["message"]
+
+
+def test_a_rollback_that_could_not_finish_is_picked_up_again_at_the_next_start(
+    repo, runner, healthy
+):
+    # And the message above only gets to say "switch it off and on again"
+    # because of this. A box that could not put the old version back and then
+    # sat there for ever is the box that has to be collected from somebody's
+    # living room, which is the thing this whole module exists to avoid.
+    runner.fail_on["git reset"] = (1, "fatal: could not write .git/index")
+    updater = make(repo, runner, healthy=lambda timeout: False)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+    assert updater.state()["rollback_complete"] is False
+
+    runner.fail_on.pop("git reset")             # switched off and on; disk behaves
+    runner.calls.clear()
+    make(repo, runner, healthy).on_boot()
+
+    assert any("v1.0.3" in " ".join(c) for c in runner.ran("reset")), (
+        "it never tried again to put the old version back"
+    )
+    assert updater.state()["rollback_complete"] is True
+
+
+def test_a_finished_rollback_is_not_done_all_over_again_at_every_start(
+    repo, runner, healthy
+):
+    updater = make(repo, runner, healthy=lambda timeout: False)
+    with pytest.raises(UpdateError):
+        updater.apply("1.1.0")
+    assert updater.state()["rollback_complete"] is True
+
+    runner.calls.clear()
+    make(repo, runner, healthy).on_boot()
+    assert runner.calls == [], "it rolled a settled box back on every start-up"
+
+
+def test_a_state_file_written_by_an_older_version_is_not_rolled_back_at_boot(
+    repo, runner, healthy
+):
+    # Boxes in the field have a state file with no rollback_complete in it at
+    # all, written before this version existed. "I do not know" is not "it
+    # failed", and treating it as one would reset and reinstall every one of
+    # them at the next start-up.
+    updater = make(repo, runner, healthy)
+    updater._write_state(
+        phase="rolled_back", stage="done", previous_ref="v1.0.3", to_version="1.1.0",
+    )
+    runner.calls.clear()
+    make(repo, runner, healthy).on_boot()
+    assert runner.calls == []
+
+
+# ==========================================================================
 # An update is not finished until the box has been switched on again
 # ==========================================================================
 def test_an_update_that_passed_its_health_check_is_on_probation_not_finished(
@@ -354,6 +855,49 @@ def test_repeated_unhealthy_boots_roll_back_without_being_asked(repo, runner):
     make(repo, runner, sick).on_boot()
     assert any("v1.0.3" in " ".join(c) for c in runner.ran("reset")), (
         "it never gave up on a version that will not come up"
+    )
+
+
+def test_the_third_start_with_no_picture_is_the_one_that_rolls_the_box_back(
+    repo, runner
+):
+    """The number itself, spelled out, rather than taken from the constant.
+
+    Every other test of this behaviour takes its loop bound from
+    MAX_BOOT_ATTEMPTS, so all of them go on passing whatever it is set to -
+    including a number so large the box never reaches it. That is a real way to
+    ship: the behaviour is there, the rollback is written, and a box that
+    cannot start its new version simply keeps trying, in somebody's living
+    room, with no dashboard to ask and nobody who can get a shell on it.
+
+    Three is the shipped answer and it is a judgement, not an accident. An
+    owner faced with a black screen switches the box off and on again, usually
+    more than once, so one or two is far too eager - it would roll back boxes
+    that were only being restarted impatiently. Three means the box has genuinely
+    failed to come up three separate times before it undoes the update, and it
+    still gets there the same evening rather than sitting broken for a week.
+    """
+    sick = lambda timeout: False
+    updater = make(repo, runner, sick)
+    updater._write_state(
+        phase="probation", boots=0, previous_ref="v1.0.3",
+        from_version="1.0.3", to_version="1.1.0",
+    )
+
+    make(repo, runner, sick).on_boot()          # switched on, no picture
+    assert runner.ran("reset") == [], "it gave up on the very first start"
+    make(repo, runner, sick).on_boot()
+    assert runner.ran("reset") == [], "it gave up after only two starts"
+
+    make(repo, runner, sick).on_boot()
+    assert any("v1.0.3" in " ".join(c) for c in runner.ran("reset")), (
+        "three starts with no picture and the box is still trying the new "
+        "version - shipped like this it never rolls itself back at all"
+    )
+    assert updater.state()["phase"] == "rolled_back"
+    assert Updater.MAX_BOOT_ATTEMPTS == 3, (
+        "the shipped number changed; if that is deliberate, this test and the "
+        "reasoning above are what has to change with it"
     )
 
 

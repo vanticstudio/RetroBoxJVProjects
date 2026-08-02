@@ -15,11 +15,27 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
+from typing import Optional
 
 from .config import CrtConfig
 
 log = logging.getLogger(__name__)
+
+#: How many generated shader files are kept in the cache directory.
+#:
+#: See :func:`write_new_shader` for why each regeneration needs a new
+#: filename. The consequence is that this box - which runs for months at a
+#: time while somebody fiddles with the curvature slider - would otherwise
+#: leave one small file behind per nudge. Three is enough to cover the one mpv
+#: is using, the one it was using a moment ago, and one spare, and it caps the
+#: directory at a few kilobytes no matter how long the box stays on.
+KEEP_GENERATIONS = 3
+
+#: The generated filenames, so old ones can be recognised and swept up. Only
+#: files this module made itself are ever deleted.
+_GENERATION_NAME = re.compile(r"crt-(\d+)\.glsl\Z")
 
 # mpv/libplacebo user-shader ("hook") template. Hooks the MAIN video plane and
 # remaps texture coordinates for the curvature, then masks/rounds/shades.
@@ -79,10 +95,15 @@ def render_shader(crt: CrtConfig) -> str:
     )
 
 
+def shader_dir() -> Path:
+    """The writable directory the generated shaders are cached in."""
+    cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return Path(cache_home) / "retrobox"
+
+
 def default_shader_path() -> Path:
     """A stable, writable location to cache the generated shader."""
-    cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    return Path(cache_home) / "retrobox" / "crt.glsl"
+    return shader_dir() / "crt.glsl"
 
 
 def write_shader(crt: CrtConfig, out_path: Path | None = None) -> Path | None:
@@ -99,4 +120,95 @@ def write_shader(crt: CrtConfig, out_path: Path | None = None) -> Path | None:
         return None
 
 
-__all__ = ["render_shader", "write_shader", "default_shader_path"]
+def write_new_shader(
+    crt: CrtConfig, directory: Optional[Path] = None
+) -> Optional[Path]:
+    """Write the shader for ``crt`` somewhere mpv has never read before.
+
+    Returns the new path, or None when the effect is off or the file could not
+    be written.
+
+    WHY A NEW FILENAME EVERY TIME, rather than rewriting one file.
+
+    mpv holds the shader it compiled from a given path. Assigning
+    ``glsl-shaders`` the string it already has is, at the option layer, not a
+    change at all - so rewriting ``crt.glsl`` and setting the same path again
+    can leave the old curvature on the screen, which is the exact bug this
+    whole feature exists to fix, only harder to see.
+
+    The other way out is to clear the property and set it again. That was
+    rejected: clearing is a real change that mpv acts on, so for however many
+    frames sit between the two writes the picture has NO shader on it. Somebody
+    dragging the curvature slider would watch the effect flicker off and back
+    on with every step - which is precisely the "save, restart, judge" misery
+    this replaces, just faster. Pointing at a new filename is one property
+    write, so the picture goes straight from the old effect to the new one.
+
+    The cost of that choice is litter, and it is paid here: old generations are
+    swept up on the way past, so the directory stays at :data:`KEEP_GENERATIONS`
+    files however long the box runs. Numbering carries on from whatever is
+    already in the directory, so a shader left behind by an earlier run (the
+    box is switched off at the wall, mid-write is always possible) is never
+    handed back to mpv as if it were new.
+    """
+    if not crt.enabled:
+        return None
+    directory = directory or shader_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        generation = _next_generation(directory)
+        out_path = directory / f"crt-{generation}.glsl"
+        out_path.write_text(render_shader(crt), encoding="utf-8")
+    except OSError:
+        log.warning("could not write CRT shader; leaving the picture as it is",
+                    exc_info=True)
+        return None
+    _sweep_old_generations(directory, newest=generation)
+    return out_path
+
+
+def _next_generation(directory: Path) -> int:
+    """One past the highest generation number already in ``directory``."""
+    highest = 0
+    try:
+        entries = list(directory.iterdir())
+    except OSError:                       # pragma: no cover - raced with a sweep
+        return 1
+    for entry in entries:
+        match = _GENERATION_NAME.match(entry.name)
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return highest + 1
+
+
+def _sweep_old_generations(directory: Path, *, newest: int) -> None:
+    """Delete generations older than the last :data:`KEEP_GENERATIONS`.
+
+    The one just written is obviously kept, and so are the couple before it:
+    setting ``glsl-shaders`` tells mpv to go and read the file, and it does
+    that on its own render thread. Deleting the outgoing shader in the same
+    breath would be a race with that read, and losing it means a frame with no
+    effect on it. Keeping a couple of generations costs a few kilobytes.
+    """
+    oldest_kept = newest - KEEP_GENERATIONS + 1
+    try:
+        entries = list(directory.iterdir())
+    except OSError:                       # pragma: no cover - hostile fs
+        return
+    for entry in entries:
+        match = _GENERATION_NAME.match(entry.name)
+        if match and int(match.group(1)) < oldest_kept:
+            try:
+                entry.unlink()
+            except OSError:               # pragma: no cover - already gone
+                log.debug("could not remove old CRT shader %s", entry, exc_info=True)
+
+
+__all__ = [
+    "KEEP_GENERATIONS",
+    "render_shader",
+    "write_shader",
+    "write_new_shader",
+    "default_shader_path",
+    "shader_dir",
+]

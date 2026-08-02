@@ -248,7 +248,14 @@ def _hex_to_ass(hex_color: str, alpha: int = 0) -> str:
 
 
 def _style(ui: UiConfig, *, size: int, alpha: int = 0) -> str:
-    """Common ASS override tags: retro font, green fill, and a soft CRT glow."""
+    """Common ASS override tags: retro font, green fill, and a soft CRT glow.
+
+    ``ui.font`` is spliced straight into the override block below, so a name
+    containing "}" or a backslash would close this block and open another one
+    - the font name could then rewrite whatever the box puts on screen. It is
+    safe to splice because ``config.parse_font`` refuses anything but a plain
+    font name at the loader; do not start accepting one from anywhere else.
+    """
     color = _hex_to_ass(ui.color, alpha)
     tags = rf"\fn{ui.font}\b1\fs{size}\c{color}\1a&H{alpha:02X}&"
     if ui.glow:

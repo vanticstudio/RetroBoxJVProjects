@@ -128,10 +128,28 @@ def _same_device(a: Union[str, Path], b: Union[str, Path]) -> bool:
 # ==========================================================================
 # Temperature and load
 # ==========================================================================
-def temperature() -> Optional[Dict[str, Any]]:
-    """The warmest thermal zone, or None on a machine that has no sensor."""
+def temperature(
+    thermal_root: Optional[Union[str, Path]] = None,
+) -> Optional[Dict[str, Any]]:
+    """The warmest thermal zone, or None on a machine that has no sensor.
+
+    ``thermal_root`` is injectable, the way ``sensors.py`` and ``display.py``
+    take their sysfs roots as parameters, so a test can point this at a
+    fixture tree it built itself instead of reading whatever ``/sys`` happens
+    to contain on the machine running the suite - a test that reads real
+    machine state is not testing anything repeatable, and would pass or fail
+    differently on a Mac with no ``/sys`` at all, a Linux CI runner, and the
+    box itself.
+
+    The default stays ``None`` rather than binding straight to ``THERMAL_ROOT``
+    so that code (and the handful of existing callers) that monkeypatches the
+    module-level ``THERMAL_ROOT`` for the no-argument call keeps working: a
+    bound default would freeze in the real path at import time and ignore a
+    later monkeypatch of the module attribute.
+    """
+    root = Path(thermal_root) if thermal_root is not None else THERMAL_ROOT
     try:
-        zones = sorted(THERMAL_ROOT.glob("thermal_zone*"))
+        zones = sorted(root.glob("thermal_zone*"))
     except OSError:
         return None
 
@@ -279,6 +297,20 @@ def timezone() -> Dict[str, Any]:
     clock has drifted produces wrong behaviour that looks like a bug in the
     schedule. A box with no internet has no NTP, which is worth saying out
     loud rather than leaving to be discovered.
+
+    Three things are reported rather than one, because they fail separately
+    and mean different things:
+
+    * ``synchronised`` - the box's own opinion. True, False, or **None** for
+      "cannot tell", which is not a polite way of saying no.
+    * ``last_sync`` / ``last_sync_state`` - *when* it last actually worked.
+      "Four minutes ago" and "never" are completely different states and the
+      owner has to be able to tell them apart; ``unknown`` is the third honest
+      answer and it is kept distinct from ``never`` on purpose, because
+      "never synchronised" is what sends somebody off to buy a battery.
+    * ``plausible`` - whether the date is one this software could be running
+      on at all. A ten-year-old office mini PC with a flat CMOS cell comes up
+      in 2011 every time it loses power, and *that* is the fault, not drift.
     """
     info: Dict[str, Any] = {
         "timezone": None,
@@ -286,7 +318,10 @@ def timezone() -> Dict[str, Any]:
         "synchronised": None,
         "ntp_active": None,
     }
-    for line in _run(["timedatectl", "show"]).splitlines():
+    # Read once and hand the same text to timekeeping, rather than shelling
+    # out to the same command twice for one page.
+    shown = _run(["timedatectl", "show"])
+    for line in shown.splitlines():
         key, _, value = line.partition("=")
         if key == "Timezone":
             info["timezone"] = value
@@ -299,7 +334,27 @@ def timezone() -> Dict[str, Any]:
         # No timedatectl (a container, a non-systemd box). Fall back to what
         # Python knows rather than showing nothing at all.
         info["timezone"] = time.tzname[0] if time.tzname else None
-    info["warning"] = info["synchronised"] is False
+
+    # Imported here rather than at the top because timekeeping reaches back
+    # into this module for the machine's timezone list, and a health page must
+    # not be the thing that discovers an import cycle.
+    from . import timekeeping
+
+    try:
+        sync = timekeeping.sync_status(reader=lambda: shown)
+    except Exception:  # noqa: BLE001 - a health page never breaks on a reading
+        log.debug("could not read the time sync detail", exc_info=True)
+        sync = {"last_sync": None, "last_sync_state": "unknown", "summary": None,
+                "fix": None}
+    info["last_sync"] = sync.get("last_sync")
+    info["last_sync_state"] = sync.get("last_sync_state", "unknown")
+    info["sync_summary"] = sync.get("summary")
+    info["sync_fix"] = sync.get("fix")
+
+    info["plausible"] = timekeeping.clock_is_plausible()
+    # An implausible date is a louder problem than an unsynchronised one: it
+    # is already producing the wrong television, not merely at risk of it.
+    info["warning"] = info["synchronised"] is False or not info["plausible"]
     return info
 
 

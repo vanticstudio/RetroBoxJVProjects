@@ -17,7 +17,10 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the import cheap
+    from .config import CrtConfig
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +51,24 @@ class Player(ABC):
 
     def set_mouse_enabled(self, enabled: bool) -> None:
         """Start/stop reporting pointer activity. Default: nothing to do."""
+
+    def set_crt(self, crt: "CrtConfig") -> bool:
+        """Change the CRT picture effect on the picture that is showing now.
+
+        Curvature is a taste setting with no correct value: the only way
+        anybody sets it sensibly is by dragging the dashboard slider while
+        watching the television, so it has to take effect there and then.
+
+        ``crt.enabled`` False means NO shader - not a shader that does nothing.
+        An identity pass still costs this box's two-core Celeron real GPU work
+        every frame for a picture indistinguishable from having none.
+
+        Returns True when the picture was changed. False means it was left
+        exactly as it was (and said so in the log) - never an exception, and
+        never a blank screen: the effect is cosmetic and outranked by the
+        programme somebody is halfway through. Default: nothing to do.
+        """
+        return False
 
     def get_hwdec(self) -> Optional[str]:
         """The decoder actually in use, e.g. "vaapi", or None for software."""
@@ -202,7 +223,8 @@ class MpvPlayer(Player):
         if glsl_shaders:
             # CRT curvature/rounding/vignette/scanlines. Applied globally (always
             # on) so a newly-loaded episode is never shown for a frame or two
-            # without the effect on a channel change.
+            # without the effect on a channel change. This is only the STARTING
+            # value - see set_crt, which changes it while the television is on.
             options["glsl_shaders"] = glsl_shaders
         if force_4_3:
             # Fit ANY source into a 4:3 raster (letterboxing 16:9 with black
@@ -219,6 +241,9 @@ class MpvPlayer(Player):
         self._mpv = mpv.MPV(**options)
         self._closed = False
         self._mouse_bound = False
+        # The shader file mpv is currently reading from, so set_crt can tell
+        # what it would be replacing. None means the effect is off.
+        self._crt_shader: Optional[str] = glsl_shaders or None
         # True while a looping filler clip (static / colour bars) is showing, so
         # its (non-)ending never advances the channel.
         self._suppress = True
@@ -409,6 +434,56 @@ class MpvPlayer(Player):
         except Exception:  # noqa: BLE001
             log.debug("toggling mouse support failed", exc_info=True)
 
+    def set_crt(self, crt: "CrtConfig") -> bool:
+        """Regenerate the CRT shader and put it on the live picture.
+
+        mpv takes glsl-shaders at runtime perfectly well; the trap is that it
+        keeps the shader it compiled from a path, so it has to be handed a
+        filename it has not read before. :func:`crt.write_new_shader` is what
+        guarantees that (and sweeps the old ones up) - the reasoning, and the
+        clear-and-set alternative that was rejected, are written down there.
+
+        Nothing here touches what is playing: no loadfile, no seek, no pause.
+        The frame on screen keeps going and simply comes out looking different.
+        """
+        from .crt import write_new_shader
+
+        if not crt.enabled:
+            # OFF clears the property outright. Writing an identity shader
+            # instead would keep a GLSL pass running every frame on a two-core
+            # Celeron to produce the picture it was already producing.
+            if self._crt_shader is None:
+                return True                      # already off; nothing to do
+            try:
+                self._mpv["glsl-shaders"] = ""
+            except Exception:  # noqa: BLE001 - the programme outranks the effect
+                log.warning("could not clear the CRT shader", exc_info=True)
+                return False
+            self._crt_shader = None
+            return True
+
+        path = write_new_shader(crt)
+        if path is None:
+            # A full or read-only cache disk. Say so and leave the effect that
+            # is already on the picture exactly where it is.
+            log.warning("could not write a new CRT shader; picture left as it was")
+            return False
+
+        try:
+            self._mpv["glsl-shaders"] = str(path)
+        except Exception:  # noqa: BLE001
+            # crt.py's promise, kept at runtime: a shader mpv will not take is
+            # logged and the television carries on playing. mpv itself does the
+            # same for one that fails to COMPILE - it logs and renders the
+            # frame without it - so neither case can take the picture down.
+            log.warning(
+                "mpv would not take the new CRT shader; picture left as it was",
+                exc_info=True,
+            )
+            return False
+        self._crt_shader = str(path)
+        return True
+
     def _handle_click(self, key_state=None, *_args) -> None:  # pragma: no cover - needs libmpv
         """mpv key-binding callback. Fires on any thread, so keep it tiny."""
         # key_state looks like "d-" (down) / "u-" ; ignore the release half.
@@ -473,6 +548,11 @@ class MockPlayer(Player):
         self.paused = False
         self.audio_device: Optional[str] = None
         self.mouse_enabled = False
+        #: The CRT effect currently on the picture, or None when it is off.
+        self.crt: Optional["CrtConfig"] = None
+        #: Every effect applied, in order, so a test can prove the dashboard's
+        #: slider reached the picture without a television being attached.
+        self.crt_applied: List[Optional["CrtConfig"]] = []
         self.hwdec: Optional[str] = None
         #: Tests set this to a normalised (x, y) to simulate a pointer.
         self.mouse_position: Optional[Tuple[float, float]] = None
@@ -489,6 +569,15 @@ class MockPlayer(Player):
     def set_mouse_enabled(self, enabled: bool) -> None:
         self.mouse_enabled = bool(enabled)
         self._log(f"MOUSE {'ON' if enabled else 'OFF'}")
+
+    def set_crt(self, crt: "CrtConfig") -> bool:
+        # No shader is written here: there is no mpv to read one. What is
+        # recorded is the state a real player would have put on the picture -
+        # the settings, or None for "no shader at all".
+        self.crt = crt if crt.enabled else None
+        self.crt_applied.append(self.crt)
+        self._log(f"CRT {'OFF' if self.crt is None else f'curvature {crt.curvature}'}")
+        return True
 
     def get_hwdec(self) -> Optional[str]:
         return self.hwdec

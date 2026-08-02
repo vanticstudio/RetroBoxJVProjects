@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import sys
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .daypart import Daypart, DaypartError, parse_clock
 
@@ -24,9 +27,323 @@ DEFAULT_VIDEO_EXTENSIONS: tuple[str, ...] = (
     ".mp4", ".mkv", ".avi", ".m4v", ".mov", ".webm", ".mpg", ".mpeg", ".ts",
 )
 
+#: Where this copy of the software is installed - the directory holding the
+#: ``retrobox`` package. Worked out from where this file lives rather than
+#: read from anywhere, for the reason the updater does the same: a path that
+#: can be pointed somewhere else is a path that can be pointed anywhere.
+INSTALL_ROOT: Path = Path(__file__).resolve().parent.parent
+
 
 class ConfigError(Exception):
     """Raised when the configuration file is missing or invalid."""
+
+
+# ===========================================================================
+# The two kinds of value in this file that can hurt somebody
+# ===========================================================================
+# There are exactly two, and everything in this section exists to settle both
+# of them HERE rather than in the dashboard:
+#
+#   (a) a value that becomes the argv of a subprocess - power_off_command,
+#       input.cec_binary, input.cec_osd_name;
+#   (b) a value that becomes a folder this box reads, writes or deletes
+#       inside - media_root, a channel's path, a daypart's path, bumpers,
+#       assets_dir, input.web_socket.
+#
+# config.yaml can be replaced wholesale by anyone who can reach the dashboard,
+# which has no password by design. It can also arrive as a restored backup, a
+# factory reset, or a file somebody edited by hand over the file share. A check
+# that lives in a web route only covers the first of those, and has twice now
+# been found to cover only the field somebody remembered. So the rule is
+# enforced by the loader, which every one of those paths goes through.
+#
+# The shape of every check below is the same as the power_off_command one: ask
+# "is this one of the things this box accepts", never "does this look
+# dangerous". Spotting dangerous text is a game you lose once; a list you can
+# read in full is not.
+#
+# A refused value is dropped and recorded on the Config rather than made fatal
+# - see the note above `refusals` - because a box that will not boot is
+# unrecoverable and one field falling back to its default is not.
+
+
+#: Every suffix this box will agree is a video. Compare with ``in``.
+#:
+#: ``video_extensions`` decides what :func:`safepath.safe_media_name` will let
+#: an unauthenticated upload write, so one extra entry on that list - ".py",
+#: ".service", ".sh" - is an upload endpoint for that kind of file. A closed
+#: table of real container formats is the only version of this check that
+#: cannot be talked around: anything not spelled out here is refused, and a
+#: format nobody thought of is a two-word patch rather than a break-in.
+VIDEO_EXTENSIONS_ALLOWED: frozenset = frozenset({
+    # The ones anybody actually has.
+    ".mp4", ".m4v", ".mkv", ".avi", ".mov", ".webm", ".ts", ".m2ts", ".mts",
+    ".mpg", ".mpeg", ".mpe", ".m1v", ".m2v", ".mpv", ".vob", ".ogv", ".ogm",
+    # Older rips and camera files, still found in real libraries.
+    ".divx", ".flv", ".f4v", ".wmv", ".asf", ".rm", ".rmvb", ".3gp", ".3g2",
+    ".mxf", ".qt", ".dv", ".amv", ".nsv", ".mod", ".tod", ".dat",
+})
+
+
+def parse_video_extensions(raw: Any) -> tuple[str, ...]:
+    """Turn a ``video_extensions`` config value into a tuple, or refuse it.
+
+    One bad entry refuses the whole list. Keeping the good ones and dropping
+    the rest would be a quiet correction, and quiet corrections are how
+    somebody ends up running a setting they never chose.
+    """
+    if raw is None:
+        return DEFAULT_VIDEO_EXTENSIONS
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError("'video_extensions' must be a non-empty list")
+
+    cleaned: List[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise ConfigError("'video_extensions' must be a list of text suffixes")
+        suffix = item.strip().lower()
+        if not suffix.startswith("."):
+            suffix = f".{suffix}"
+        if suffix not in VIDEO_EXTENSIONS_ALLOWED:
+            shown = suffix if len(suffix) <= 20 else suffix[:20] + "..."
+            raise ConfigError(
+                f"'video_extensions' contains {shown!r}, which is not a video "
+                f"format this box knows. It has to be a container like "
+                f"\".mp4\", \".mkv\" or \".avi\" - the upload endpoint uses this "
+                f"list to decide what it is allowed to write to the disk."
+            )
+        if suffix not in cleaned:
+            cleaned.append(suffix)
+    return tuple(cleaned)
+
+
+@lru_cache(maxsize=1)
+def _sensitive_dirs() -> tuple:
+    """Directories a folder of videos is never kept in.
+
+    Deny by place rather than by trying to list everywhere a library is
+    ALLOWED to be, because the allowed list is unknowable: an external drive
+    turns up at /mnt or /media or /run/media, an NFS or SMB share is mounted
+    wherever the customer felt like, and plenty of people keep the lot in
+    ~/Videos. Enumerating those would ship a box whose library has vanished,
+    and a box whose library has vanished is a van and an afternoon.
+    """
+    names = [
+        # The operating system, and everywhere a program, a library or a
+        # systemd unit lives. /etc covers sudoers.d and the system unit
+        # directory; /usr and /lib cover the vendor unit directories.
+        "/etc", "/boot", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32",
+        "/usr", "/opt", "/root", "/run", "/proc", "/sys", "/dev",
+        # Only the parts of /var that hold something executed or scheduled -
+        # /var/spool/cron is a crontab, which is a shell. NOT the whole of
+        # /var: some systems put the temporary directory under it, and
+        # refusing those would reject configs that were always fine.
+        "/var/lib", "/var/log", "/var/spool", "/var/cache", "/var/mail",
+        "/var/backups", "/var/opt",
+        # macOS equivalents, so a developer's machine refuses what the box
+        # refuses instead of finding out on the hardware.
+        "/System", "/Library", "/Applications",
+    ]
+    dirs = [Path(name) for name in names]
+    # The software itself and the virtualenv it runs in. This is the whole
+    # point of the exercise: a library root inside the checkout turns the
+    # upload endpoint into an editor for the program that serves it.
+    dirs.append(INSTALL_ROOT)
+    dirs.append(Path(sys.prefix))
+    dirs.append(Path(sys.base_prefix))
+
+    resolved: List[Path] = []
+    for item in dirs:
+        try:
+            real = item.resolve()
+        except OSError:                       # pragma: no cover - hostile fs
+            continue
+        # "/" would deny every path there is, which would take the picture
+        # away rather than protect it. It is refused by the containment rule
+        # below instead, which is where it belongs.
+        if real != real.parent and real not in resolved:
+            resolved.append(real)
+    return tuple(resolved)
+
+
+def location_refusal(path: Any, *, allow: Sequence[Path] = ()) -> Optional[str]:
+    """Why ``path`` is not a place this box may keep or write videos, or None.
+
+    Resolves first, so a symlink planted under the media root is judged by
+    where it actually goes rather than by what it is called.
+    """
+    try:
+        resolved = Path(path).resolve()
+    except OSError:                           # pragma: no cover - hostile fs
+        return f"{path} cannot be resolved to a real location"
+
+    for permitted in allow:
+        if resolved == permitted or permitted in resolved.parents:
+            return None
+
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):           # pragma: no cover - no home at all
+        home = None
+
+    if home is not None:
+        if resolved == home:
+            return (
+                f"{resolved} is the box user's home directory, which holds "
+                f"their shell startup files and their .ssh - point this at a "
+                f"folder inside it, such as {home / 'Videos'}"
+            )
+        if home in resolved.parents:
+            # Dotfiles, and only under the home directory. This is not a
+            # blanket "no hidden folders" rule: the installer deliberately
+            # ships a channel pointed at a .welcome folder under the media
+            # root, and hidden folders on a drive are ordinary.
+            relative = resolved.relative_to(home)
+            if any(part.startswith(".") for part in relative.parts):
+                return (
+                    f"{resolved} is among the box user's dotfiles, where their "
+                    f"keys, shell startup files and user services live"
+                )
+
+    sensitive_dirs = _sensitive_dirs()
+    for sensitive in sensitive_dirs:
+        if resolved == sensitive:
+            return f"{resolved} belongs to the system, not to the library"
+        if sensitive in resolved.parents:
+            return f"{resolved} is inside {sensitive}, which belongs to the system"
+
+    # A path that CONTAINS one of these is exactly as wrong as one inside it:
+    # media_root "/" makes /etc a channel, and "/home" makes every account on
+    # the box one.
+    accounts = [Path("/home"), Path("/Users")]
+    if home is not None:
+        accounts.append(home)
+    for anchor in list(sensitive_dirs) + accounts:
+        if resolved == anchor or resolved in anchor.parents:
+            return f"{resolved} holds {anchor}, which belongs to the system"
+    return None
+
+
+def check_location(path: Any, *, field: str, allow: Sequence[Path] = ()) -> None:
+    """Raise :class:`ConfigError` if ``field`` names somewhere it must not."""
+    reason = location_refusal(path, allow=allow)
+    if reason:
+        raise ConfigError(f"'{field}' is not a folder this box will use: {reason}")
+
+
+#: What ``input.cec_binary`` is allowed to be. libCEC's client is the only
+#: program whose output the CEC backend can read, so this is the same closed
+#: table :data:`POWER_OFF_COMMANDS` is - the value becomes argv[0] of a real
+#: ``subprocess.Popen``. The version suffix is allowed because some distros
+#: ship ``cec-client-6.0.2`` and symlink the plain name at it.
+_CEC_BINARY_NAME = re.compile(r"cec-client(-[0-9][0-9.]*)?$")
+_CEC_BINARY_DIRS = ("", "/usr/bin", "/bin", "/usr/local/bin", "/sbin", "/usr/sbin")
+
+
+def parse_cec_binary(raw: Any) -> str:
+    """Turn an ``input.cec_binary`` value into a program name, or refuse it."""
+    if not isinstance(raw, str):
+        raise ConfigError("'input.cec_binary' must be text")
+    text = raw.strip()
+    directory, _, name = text.rpartition("/")
+    if (
+        not text
+        or not _CEC_BINARY_NAME.fullmatch(name)
+        or directory not in _CEC_BINARY_DIRS
+    ):
+        shown = text if len(text) <= 60 else text[:60] + "..."
+        raise ConfigError(
+            f"'input.cec_binary' is not a program this box will run: {shown}. "
+            f"It reads HDMI-CEC key presses, so it has to be libCEC's client - "
+            f"\"cec-client\", or the full path to one."
+        )
+    return text
+
+
+#: A CEC OSD name is what the TV shows in its input list. libCEC caps it at 14
+#: characters. It becomes an element of the same argv, so it may not start
+#: with "-" - an argument that can turn into a flag is an argument that can
+#: turn into a different command.
+_CEC_OSD_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,13}$")
+
+
+def parse_cec_osd_name(raw: Any) -> str:
+    if not isinstance(raw, str) or not _CEC_OSD_NAME.fullmatch(raw):
+        raise ConfigError(
+            "'input.cec_osd_name' must be up to 14 plain characters starting "
+            "with a letter or a digit - it is the name your TV shows for this "
+            "box, and it is handed straight to the CEC client as an argument"
+        )
+    return raw
+
+
+def parse_keyboard_devices(raw: Any) -> List[str]:
+    """Pinned evdev device nodes. Only ever ``/dev/input``."""
+    if isinstance(raw, str):
+        items = [raw]
+    elif isinstance(raw, list):
+        items = list(raw)
+    else:
+        raise ConfigError("'input.keyboard_devices' must be a list of device paths")
+    devices: List[str] = []
+    for item in items:
+        text = str(item)
+        resolved = Path(text).resolve()
+        if not str(resolved).startswith("/dev/input/"):
+            raise ConfigError(
+                f"'input.keyboard_devices' may only name devices under "
+                f"/dev/input, not {text}"
+            )
+        devices.append(text)
+    if not devices:
+        raise ConfigError("'input.keyboard_devices' cannot be empty")
+    return devices
+
+
+def parse_control_socket(raw: Any) -> str:
+    """Where the TV listens for the dashboard's commands.
+
+    ``input/web.py`` unlinks whatever this names before it binds, so a value
+    nobody checked is a delete of any file the box user owns. Two rules: it
+    has to be named like a socket, and its folder is held to the same rule a
+    library folder is - which between them leave nothing worth deleting.
+
+    The systemd runtime directory is allowed through explicitly, because that
+    is where this socket belongs on a real box (``$XDG_RUNTIME_DIR/retrobox``,
+    i.e. under /run) and /run is otherwise the system's.
+    """
+    import tempfile
+
+    text = str(raw).strip()
+    candidate = Path(os.path.expanduser(text))
+    if not text or not candidate.is_absolute() or candidate.suffix != ".sock":
+        raise ConfigError(
+            "'input.web_socket' must be an absolute path ending in '.sock' - "
+            "the box deletes whatever it names before it listens on it"
+        )
+    runtime = [Path("/run/user"), Path(tempfile.gettempdir())]
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        runtime.append(Path(xdg))
+    check_location(candidate.parent, field="input.web_socket", allow=tuple(runtime))
+    return text
+
+
+#: An OSD font name is spliced into an ASS override block by overlay.py
+#: (``\\fn<name>``), so a "}" or a backslash would close that block and open
+#: another one - the font name could then rewrite the on-screen display. Real
+#: font names are letters, digits, spaces and the odd hyphen.
+_FONT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
+
+
+def parse_font(raw: Any) -> str:
+    if not isinstance(raw, str) or not _FONT_NAME.fullmatch(raw):
+        raise ConfigError(
+            "'ui.font' must be a plain font name - letters, digits, spaces, "
+            "'.', '_' and '-' - because it is spliced into the on-screen "
+            "display's own markup"
+        )
+    return raw
 
 
 # How a channel behaves the moment you tune into it.
@@ -68,10 +385,11 @@ DEFAULT_POWER_OFF_COMMAND: tuple[str, ...] = ("sudo", "poweroff")
 def _power_off_table() -> frozenset[tuple[str, ...]]:
     """Every argv this box will ever accept as "switch the machine off".
 
-    ``power_off_command`` is the one config value that becomes the argument
-    list of a real ``subprocess.Popen`` (see ``app.py``), and the config it
-    comes from can be replaced wholesale from a dashboard with no password on
-    it. So this is a closed table and the check against it is a lookup - the
+    ``power_off_command`` becomes the argument list of a real
+    ``subprocess.Popen`` (see ``app.py``) - it is not the only one, see
+    ``parse_cec_binary`` below - and the config it comes from can be replaced
+    wholesale from a dashboard with no password on it. So this is a closed
+    table and the check against it is a lookup - the
     question asked of a value is "is this one of the commands that turn a
     computer off", never "does this one look dangerous". Spotting dangerous
     text is a game you lose once; a list you can read in full is not.
@@ -168,6 +486,64 @@ class CrtConfig:
 
 
 @dataclass(frozen=True)
+class DisplaySleepConfig:
+    """Going quiet when there is no television watching.
+
+    This is not about the eight watts. It is about a fan that roars into an
+    empty room, heat pumped into secondhand hardware that has already had one
+    life, and a box that plainly notices whether anybody is there.
+
+    ``enabled`` off means the watcher is never even built, so the box behaves
+    in every respect as it did before this existed.
+
+    IT IS OFF BY DEFAULT, AND THAT IS PENDING THE DASHBOARD, NOT PERMANENT.
+    The television half of this feature is finished; the dashboard half - the
+    panel that shows a box has gone quiet and offers the Wake button that
+    undoes it - is not. Defaulting it on would start every box already sold
+    pausing its own picture the moment it updated, with nothing on screen and
+    nothing on the dashboard connecting a black television to a box that
+    thinks it is working perfectly. These are appliances with no SSH, switched
+    off at the wall, owned by people who did not ask for a new behaviour.
+    Anybody who wants it today writes ``enabled: true`` and gets the whole
+    feature. WHOEVER SHIPS THE DASHBOARD PANEL FLIPS THIS DEFAULT, and the
+    test named for it in tests/test_config.py with it.
+
+    ``sleep_after_seconds`` is how long the video output has to have been gone
+    before the box believes it. It is a debounce, not a countdown: HDMI
+    switches, receivers and televisions drop and re-assert the line while they
+    change input, and every one of those flaps looks like somebody switching
+    the set off. The default is the one :mod:`retrobox.display` chose for
+    itself, and waiting a few seconds costs nothing because by definition
+    nobody is watching. Waking is never delayed - see display.py.
+
+    ``non_broadcast`` is the choice the box cannot make for itself.
+
+    A broadcast channel needs no setting: it works out what is airing from the
+    wall clock, so after three hours asleep it comes back three hours further
+    on, which is the entire illusion this product sells. A channel in `random`
+    or `resume` mode has no schedule to recompute from, so there are two
+    defensible answers and this picks between them:
+
+    * ``resume``  - carry on exactly where the picture was paused. Exact,
+      costs nothing, and cannot overshoot the end of a file.
+    * ``advance`` - skip forward by however long the box slept, so television
+      does not wait for you. More faithful to the idea, and it has to guess:
+      an episode whose length is not already known can be seeked past its own
+      end, in which case the channel simply rolls on to the next one.
+
+    The default is ``resume`` because it is the answer that cannot be wrong.
+    """
+
+    # Off until the dashboard can show a box has gone quiet and wake it again.
+    enabled: bool = False
+    sleep_after_seconds: float = 8.0   # display.SLEEP_DEBOUNCE_SECONDS
+    non_broadcast: str = "resume"      # resume | advance
+
+
+NON_BROADCAST_WAKE = ("resume", "advance")
+
+
+@dataclass(frozen=True)
 class WebConfig:
     """Limits on what the LAN dashboard is allowed to write to the disk.
 
@@ -205,6 +581,34 @@ class UpdateConfig:
     check: bool = True
     auto_apply: bool = False
     check_interval_hours: int = 24
+
+
+@dataclass(frozen=True)
+class TimeConfig:
+    """The clock, which on this box decides what the television shows.
+
+    ``dayparts`` change a channel's name and its folder by the hour, so a box
+    that does not know which timezone it is in plays the wrong thing at the
+    wrong time and looks broken. Nothing ever tells a freshly installed box
+    where it is, so on first start-up it works that out from its own internet
+    address (see :mod:`retrobox.timekeeping`).
+
+    ``detect_timezone`` is on by default, and it is the only setting here
+    because it is the only one that sends anything anywhere. That lookup is
+    the single outbound call this product makes about the clock: it carries
+    the request and nothing else - no serial, no version, no identifier, no
+    information about the box or what is watched on it - and it happens once,
+    and again only if the box is moved to a different connection. It is on by
+    default because a box with the wrong timezone is broken in a way its owner
+    cannot diagnose; it is a setting at all because it is somebody else's box
+    and they are entitled to say no.
+
+    Turning it off never changes the timezone the box already has, and the
+    owner can always pick one on the dashboard's System page - which is also
+    what happens on a box with no internet.
+    """
+
+    detect_timezone: bool = True
 
 
 @dataclass(frozen=True)
@@ -261,8 +665,10 @@ class Config:
     guide_seconds: float = 8.0            # how long the on-screen guide stays up
     ui: UiConfig = field(default_factory=UiConfig)
     crt: CrtConfig = field(default_factory=CrtConfig)
+    display_sleep: DisplaySleepConfig = field(default_factory=DisplaySleepConfig)
     web: WebConfig = field(default_factory=WebConfig)
     updates: UpdateConfig = field(default_factory=UpdateConfig)
+    time: TimeConfig = field(default_factory=TimeConfig)
 
     # Audio.
     initial_volume: int = 70              # 0-100
@@ -317,6 +723,20 @@ class Config:
     # Options for the input backends (see input/manager.create_backends).
     input_options: Mapping[str, Any] = field(default_factory=dict)
 
+    # Everything the loader threw away, in the words the customer should see.
+    #
+    # A value that would become argv, or a folder this box writes inside, is
+    # dropped rather than made fatal. That is deliberate and it is the same
+    # trade power_off_command already made: this box sits in a living room
+    # with no SSH and no way back in, so a config.yaml that refuses to load
+    # takes the picture away for good, which is far worse than one setting
+    # falling back to its default with a loud line in the journal.
+    #
+    # The dashboard reads this and refuses to SAVE such a config, so nobody is
+    # quietly left running settings they did not choose - the correction is
+    # never silent, it is just never fatal either. Empty when all was well.
+    refusals: tuple[str, ...] = ()
+
     def channel_numbers(self) -> List[int]:
         return [c.number for c in self.channels]
 
@@ -336,6 +756,7 @@ def _discover_channels(
     *,
     start_number: int,
     default_shuffle: bool,
+    refusals: Optional[List[str]] = None,
 ) -> List[ChannelConfig]:
     """Turn every immediate sub-folder of ``media_root`` into a channel.
 
@@ -351,6 +772,21 @@ def _discover_channels(
         (p for p in media_root.iterdir() if p.is_dir() and not p.name.startswith(".")),
         key=lambda p: p.name.lower(),
     )
+    # A sub-folder can be a symlink, and is_dir() above followed it. So even a
+    # media root that is somewhere perfectly ordinary can hold a door into
+    # /etc, and the folder scanner would have walked straight through it.
+    kept = []
+    for folder in subdirs:
+        reason = location_refusal(folder)
+        if reason:
+            note = f"the folder '{folder.name}' under media_root leads somewhere it must not: {reason}"
+            log.warning("%s - not making it a channel", note)
+            if refusals is not None:
+                refusals.append(note)
+            continue
+        kept.append(folder)
+    subdirs = kept
+
     channels: List[ChannelConfig] = []
     for offset, folder in enumerate(subdirs):
         channels.append(
@@ -371,7 +807,12 @@ def _prettify_name(folder_name: str) -> str:
     return cleaned.title() if cleaned.islower() else cleaned
 
 
-def _parse_channels(raw: Any, base: Optional[Path], default_shuffle: bool) -> List[ChannelConfig]:
+def _parse_channels(
+    raw: Any,
+    base: Optional[Path],
+    default_shuffle: bool,
+    refusals: Optional[List[str]] = None,
+) -> List[ChannelConfig]:
     if not isinstance(raw, list):
         raise ConfigError("'channels' must be a list")
     channels: List[ChannelConfig] = []
@@ -382,16 +823,32 @@ def _parse_channels(raw: Any, base: Optional[Path], default_shuffle: bool) -> Li
             raise ConfigError(f"channel #{i} is missing required key 'path'")
         number = entry.get("number", i + 2)  # old TVs often started around ch. 2
         name = entry.get("name") or _prettify_name(Path(str(entry["path"])).name)
+        folder = _as_path(entry["path"], base)
+
+        # A channel folder is where /api/media lists, deletes and overwrites,
+        # and where /api/uploads writes. One in the wrong place is dropped and
+        # the rest of the lineup carries on: five channels and one refusal is
+        # a television, and no channels at all is a service that fails to
+        # start and a customer with a black screen.
+        reason = location_refusal(folder)
+        if reason:
+            note = f"channel {number} ('{name}') was left out: {reason}"
+            log.warning("%s", note)
+            if refusals is not None:
+                refusals.append(note)
+            continue
+
         channels.append(
             ChannelConfig(
                 number=int(number),
                 name=str(name),
-                path=_as_path(entry["path"], base),
+                path=folder,
                 shuffle=bool(entry.get("shuffle", default_shuffle)),
                 exclude=_parse_str_list(entry.get("exclude"), "exclude"),
                 exclude_seasons=_parse_seasons(entry.get("exclude_seasons")),
                 dayparts=_parse_dayparts(
-                    entry.get("dayparts"), base, f"channel {number} ('{name}')"
+                    entry.get("dayparts"), base, f"channel {number} ('{name}')",
+                    refusals=refusals,
                 ),
                 bumpers=bool(entry.get("bumpers", True)),
             )
@@ -399,7 +856,12 @@ def _parse_channels(raw: Any, base: Optional[Path], default_shuffle: bool) -> Li
     return channels
 
 
-def _parse_dayparts(raw: Any, base: Optional[Path], label: str) -> tuple[Daypart, ...]:
+def _parse_dayparts(
+    raw: Any,
+    base: Optional[Path],
+    label: str,
+    refusals: Optional[List[str]] = None,
+) -> tuple[Daypart, ...]:
     """Parse a channel's ``dayparts:`` list into :class:`Daypart` windows."""
     if raw is None:
         return ()
@@ -425,12 +887,25 @@ def _parse_dayparts(raw: Any, base: Optional[Path], label: str) -> tuple[Daypart
             raise ConfigError(f"{where} cannot set both 'off_air' and 'path'")
 
         name_raw = entry.get("name")
+        folder = _as_path(path_raw, base) if path_raw else None
+        # A daypart's folder is played from exactly as a channel's is, so it
+        # is held to exactly the same rule - and the whole block goes rather
+        # than just its path, because a window that no longer changes anything
+        # is more confusing than one that is not there.
+        if folder is not None:
+            reason = location_refusal(folder)
+            if reason:
+                note = f"{where} was left out: {reason}"
+                log.warning("%s", note)
+                if refusals is not None:
+                    refusals.append(note)
+                continue
         parts.append(
             Daypart(
                 start=start,
                 end=end,
                 name=str(name_raw) if name_raw else None,
-                path=_as_path(path_raw, base) if path_raw else None,
+                path=folder,
                 off_air=off_air,
             )
         )
@@ -504,30 +979,58 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
 
     default_shuffle = bool(data.get("shuffle", True))
 
-    exts = data.get("video_extensions")
-    if exts is None:
+    # Everything this loader would not accept, collected as it goes. See the
+    # note on Config.refusals for why these are dropped rather than fatal.
+    refusals: List[str] = []
+
+    def refuse(exc: ConfigError, *, instead: str) -> None:
+        log.warning("%s - %s instead", exc, instead)
+        refusals.append(str(exc))
+
+    try:
+        extensions = parse_video_extensions(data.get("video_extensions"))
+    except ConfigError as exc:
+        refuse(exc, instead="using the usual video formats")
         extensions = DEFAULT_VIDEO_EXTENSIONS
-    else:
-        if not isinstance(exts, list) or not exts:
-            raise ConfigError("'video_extensions' must be a non-empty list")
-        extensions = tuple(e if e.startswith(".") else f".{e}" for e in (s.lower() for s in exts))
 
     media_root_raw = data.get("media_root")
     media_root = _as_path(media_root_raw, base_dir) if media_root_raw else None
+    if media_root is not None:
+        try:
+            check_location(media_root, field="media_root")
+        except ConfigError as exc:
+            refuse(exc, instead="ignoring it")
+            media_root = None
     first_channel_number = int(data.get("first_channel_number", 2))
 
     if "channels" in data:
-        channels = _parse_channels(data["channels"], media_root or base_dir, default_shuffle)
+        channels = _parse_channels(
+            data["channels"], media_root or base_dir, default_shuffle, refusals
+        )
     elif media_root is not None:
         channels = _discover_channels(
             media_root,
             start_number=first_channel_number,
             default_shuffle=default_shuffle,
+            refusals=refusals,
+        )
+    elif refusals:
+        # media_root was the only thing describing a lineup and it named a
+        # place this box will not read. There is nothing left to build a
+        # television from, so say which value did it rather than leaving
+        # somebody to guess from "no channels".
+        raise ConfigError(
+            f"configuration must define either 'channels' or 'media_root' - "
+            f"{refusals[0]}"
         )
     else:
         raise ConfigError("configuration must define either 'channels' or 'media_root'")
 
     if not channels:
+        if refusals:
+            raise ConfigError(
+                f"no channels found - {refusals[0]}"
+            )
         raise ConfigError("no channels found - check 'channels' or the folders under 'media_root'")
 
     _ensure_unique_numbers(channels)
@@ -536,8 +1039,23 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
     if tune_in not in TUNE_IN_MODES:
         raise ConfigError(f"'tune_in' must be one of {TUNE_IN_MODES}, got '{tune_in}'")
 
+    # assets_dir is a folder this box WRITES into: static_gen puts the filler
+    # clips there and /api/branding/splash lands an uploaded video there under
+    # a fixed name. Unchecked it is an arbitrary-directory write.
+    #
+    # The bundled folder is allowed through explicitly, because it lives
+    # inside the installed software - which the rule above refuses - and it is
+    # where the shipped clips actually are.
     assets_dir_raw = data.get("assets_dir")
     assets_dir = _as_path(assets_dir_raw, base_dir) if assets_dir_raw else None
+    if assets_dir is not None:
+        from .static_gen import DEFAULT_ASSETS_DIR
+
+        try:
+            check_location(assets_dir, field="assets_dir", allow=(DEFAULT_ASSETS_DIR,))
+        except ConfigError as exc:
+            refuse(exc, instead="using the assets that came with the box")
+            assets_dir = None
 
     # Absent means "yes, the shipped one". `false`, `null` or an empty string
     # mean "no splash at all" - the same spelling `sleep_timer: false` uses.
@@ -546,14 +1064,40 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
         None if splash_raw is False or splash_raw is None or splash_raw == ""
         else _as_path(splash_raw, base_dir)
     )
+    # The splash becomes an mpv `loadfile`, so what matters is that it names a
+    # video and not something else on the disk. Its FOLDER is deliberately not
+    # checked the way a library root is: the shipped clip lives inside the
+    # installed software, which is exactly where a library may not be, and
+    # `boot_splash: boot_splash.mp4` has to keep meaning that file.
+    if boot_splash is not None and boot_splash.suffix.lower() not in VIDEO_EXTENSIONS_ALLOWED:
+        refuse(
+            ConfigError(
+                f"'boot_splash' must name a video file, not {boot_splash}"
+            ),
+            instead="showing no splash",
+        )
+        boot_splash = None
 
     start_channel = data.get("start_channel")
     start_channel = int(start_channel) if start_channel is not None else None
 
     initial_volume = _clamp_int(data.get("initial_volume", 70), 0, 100, "initial_volume")
     volume_step = _clamp_int(data.get("volume_step", 5), 1, 100, "volume_step")
+    # An mpv option value rather than an argv element, so this is a much
+    # smaller thing than the checks above - but a device name is "alsa/hdmi:
+    # CARD=HDMI,DEV=0" and never contains a newline or a control character,
+    # and something that does is not a device name.
     audio_device = data.get("audio_device")
     audio_device = str(audio_device) if audio_device else None
+    if audio_device and (
+        len(audio_device) > 200
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in audio_device)
+    ):
+        refuse(
+            ConfigError("'audio_device' is not the name of an audio output"),
+            instead="letting mpv choose",
+        )
+        audio_device = None
 
     sleep_steps = _parse_sleep_steps(data.get("sleep_timer"))
     sleep_action = str(data.get("sleep_action", "standby")).strip().lower()
@@ -562,8 +1106,16 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
             f"'sleep_action' must be one of {SLEEP_ACTIONS}, got '{sleep_action}'"
         )
 
+    # Every clip in here is played, so it is a folder the box reads inside and
+    # gets the same treatment a channel's does.
     bumpers_raw = data.get("bumpers")
     bumpers_dir = _as_path(bumpers_raw, media_root or base_dir) if bumpers_raw else None
+    if bumpers_dir is not None:
+        try:
+            check_location(bumpers_dir, field="bumpers")
+        except ConfigError as exc:
+            refuse(exc, instead="playing no bumpers")
+            bumpers_dir = None
 
     # Deliberately not fatal, unlike every other bad value in this function.
     # This box sits in somebody's living room with no SSH and no way back in;
@@ -580,6 +1132,7 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
         power_off_refused = str(exc)
         power_off_command = DEFAULT_POWER_OFF_COMMAND
         log.warning("%s - using %s instead", exc, " ".join(power_off_command))
+        refusals.append(power_off_refused)
 
     return Config(
         channels=channels,
@@ -595,10 +1148,12 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
         channel_bug_seconds=_clamp_float(data.get("channel_bug_seconds", 4.0), 0.0, 60.0, "channel_bug_seconds"),
         osd_duration=_clamp_float(data.get("osd_duration", 2.0), 0.0, 60.0, "osd_duration"),
         guide_seconds=_clamp_float(data.get("guide_seconds", 8.0), 0.0, 120.0, "guide_seconds"),
-        ui=_parse_ui(data.get("ui")),
+        ui=_parse_ui(data.get("ui"), refusals),
         crt=_parse_crt(data.get("crt")),
+        display_sleep=_parse_display_sleep(data.get("display_sleep")),
         web=_parse_web(data.get("web")),
         updates=_parse_updates(data.get("updates")),
+        time=_parse_time(data.get("time")),
         initial_volume=initial_volume,
         volume_step=volume_step,
         audio_device=audio_device,
@@ -619,7 +1174,8 @@ def config_from_dict(data: Dict[str, Any], *, base_dir: Optional[Path] = None) -
         media_root=media_root,
         first_channel_number=first_channel_number,
         auto_channels=bool(data.get("auto_channels", False)),
-        input_options=dict(data.get("input") or {}),
+        input_options=parse_input_options(data.get("input"), refusals),
+        refusals=tuple(refusals),
     )
 
 
@@ -639,18 +1195,62 @@ def load_config(path: os.PathLike | str) -> Config:
     return config_from_dict(data, base_dir=cfg_path.parent)
 
 
-def _parse_ui(raw: Any) -> UiConfig:
+def _parse_ui(raw: Any, refusals: Optional[List[str]] = None) -> UiConfig:
     if raw is None:
         return UiConfig()
     if not isinstance(raw, dict):
         raise ConfigError("'ui' must be a mapping")
     defaults = UiConfig()
+    try:
+        font = parse_font(raw.get("font", defaults.font))
+    except ConfigError as exc:
+        log.warning("%s - using %s instead", exc, defaults.font)
+        if refusals is not None:
+            refusals.append(str(exc))
+        font = defaults.font
     return UiConfig(
-        font=str(raw.get("font", defaults.font)),
+        font=font,
         color=_valid_color(raw.get("color", defaults.color), "ui.color"),
         dim_color=_valid_color(raw.get("dim_color", defaults.dim_color), "ui.dim_color"),
         glow=bool(raw.get("glow", defaults.glow)),
     )
+
+
+def parse_input_options(
+    raw: Any, refusals: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Check the ``input:`` block, dropping anything the box will not act on.
+
+    Three of these become part of a real command line and one becomes a file
+    the box deletes, so the block gets the same treatment ``power_off_command``
+    does: a value that is not on the list is thrown away here, where it can
+    never reach ``subprocess.Popen`` or ``unlink``, and the backend falls back
+    to its own default. Everything else in the block is a switch, a name
+    filter or a key map and is checked where it is used.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("'input' must be a mapping")
+
+    options = dict(raw)
+    checkers = {
+        "cec_binary": parse_cec_binary,
+        "cec_osd_name": parse_cec_osd_name,
+        "keyboard_devices": parse_keyboard_devices,
+        "web_socket": parse_control_socket,
+    }
+    for key, check in checkers.items():
+        if options.get(key) is None:
+            continue
+        try:
+            options[key] = check(options[key])
+        except ConfigError as exc:
+            log.warning("%s - leaving input.%s at its default", exc, key)
+            if refusals is not None:
+                refusals.append(str(exc))
+            options.pop(key)
+    return options
 
 
 def _parse_crt(raw: Any) -> CrtConfig:
@@ -668,6 +1268,39 @@ def _parse_crt(raw: Any) -> CrtConfig:
         scanline_intensity=_clamp_float(
             raw.get("scanline_intensity", d.scanline_intensity), 0.0, 1.0, "crt.scanline_intensity"
         ),
+    )
+
+
+def _parse_display_sleep(raw: Any) -> DisplaySleepConfig:
+    """Read the ``display_sleep:`` block.
+
+    An unknown ``non_broadcast`` word falls back to the default rather than
+    refusing to load. The rule this file already follows for anything that
+    could take the picture away applies here as much as anywhere: a box in
+    somebody's living room with a typo in it must still come up playing.
+    """
+    if raw is None:
+        return DisplaySleepConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'display_sleep' must be a mapping")
+    d = DisplaySleepConfig()
+    wake = str(raw.get("non_broadcast", d.non_broadcast)).strip().lower()
+    if wake not in NON_BROADCAST_WAKE:
+        log.warning(
+            "display_sleep.non_broadcast must be one of %s, not %r - using %s",
+            ", ".join(NON_BROADCAST_WAKE), wake, d.non_broadcast,
+        )
+        wake = d.non_broadcast
+    return DisplaySleepConfig(
+        enabled=bool(raw.get("enabled", d.enabled)),
+        # An hour is already far past the point of usefulness, and the floor
+        # of zero means "act on the first confirmed absence" for somebody who
+        # has a television that does not flap.
+        sleep_after_seconds=_clamp_float(
+            raw.get("sleep_after_seconds", d.sleep_after_seconds),
+            0.0, 3600.0, "display_sleep.sleep_after_seconds",
+        ),
+        non_broadcast=wake,
     )
 
 
@@ -714,6 +1347,24 @@ def _parse_updates(raw: Any) -> UpdateConfig:
             1, 720, "updates.check_interval_hours",
         ),
     )
+
+
+def _parse_time(raw: Any) -> TimeConfig:
+    """The clock section.
+
+    A value that is not a yes or a no falls back to the default rather than
+    refusing to load, the same way ``updates`` and ``web`` treat theirs. This
+    box has no SSH and sits in somebody's living room, so a config.yaml that
+    will not load takes the television away for good, and "detection stayed
+    on" is a far smaller problem than "there is no picture".
+    """
+    if raw is None:
+        return TimeConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'time' must be a mapping")
+    d = TimeConfig()
+    return TimeConfig(detect_timezone=bool(raw.get("detect_timezone",
+                                                   d.detect_timezone)))
 
 
 def _offset_range(data: Dict[str, Any]) -> tuple[float, float]:
@@ -786,17 +1437,30 @@ __all__ = [
     "ChannelConfig",
     "UiConfig",
     "CrtConfig",
+    "DisplaySleepConfig",
     "WebConfig",
     "UpdateConfig",
     "ConfigError",
     "load_config",
     "config_from_dict",
+    "check_location",
+    "location_refusal",
+    "parse_cec_binary",
+    "parse_cec_osd_name",
+    "parse_control_socket",
+    "parse_font",
+    "parse_input_options",
+    "parse_keyboard_devices",
     "parse_power_off_command",
+    "parse_video_extensions",
     "DEFAULT_BOOT_SPLASH",
     "DEFAULT_POWER_OFF_COMMAND",
     "DEFAULT_VIDEO_EXTENSIONS",
+    "INSTALL_ROOT",
     "POWER_OFF_COMMANDS",
     "TUNE_IN_MODES",
     "TRANSITION_EFFECTS",
     "SLEEP_ACTIONS",
+    "NON_BROADCAST_WAKE",
+    "VIDEO_EXTENSIONS_ALLOWED",
 ]

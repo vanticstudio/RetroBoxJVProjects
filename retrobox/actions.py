@@ -32,20 +32,59 @@ class Action(Enum):
     SHUTDOWN = auto()       # shut the machine down cleanly (menu / dashboard)
     POWER = auto()          # toggle standby (blank screen)
     RELOAD = auto()         # re-read config.yaml (the dashboard changed it)
+    CRT_PREVIEW = auto()    # try picture settings on the live screen, unsaved
+    CRT_CANCEL = auto()     # throw the preview away, back to what was saved
+    WAKE = auto()           # the box went quiet with nothing watching: bring it back
     QUIT = auto()           # shut the application down entirely
+
+
+@dataclass(frozen=True)
+class CrtSettings:
+    """A partial adjustment to the CRT picture effect, as a slider makes one.
+
+    Every field is optional and None means "leave this one alone". A dashboard
+    dragging one control sends only the control that moved, and the running
+    television merges it onto what it is already showing - so a curvature drag
+    does not quietly reset the scanlines somebody set a moment earlier.
+
+    This is deliberately NOT a :class:`~retrobox.config.CrtConfig`. A CrtConfig
+    is a complete, saved picture; this is an unsaved nudge to part of one, and
+    the type difference is what stops a preview being mistaken for something
+    somebody committed to.
+    """
+
+    enabled: Optional[bool] = None
+    curvature: Optional[float] = None
+    corner_radius: Optional[float] = None
+    vignette: Optional[float] = None
+    scanlines: Optional[bool] = None
+    scanline_intensity: Optional[float] = None
+
+    def changes(self) -> dict:
+        """The fields that were actually given, ready to merge onto a config."""
+        return {
+            name: value
+            for name, value in vars(self).items()
+            if value is not None
+        }
 
 
 @dataclass(frozen=True)
 class InputEvent:
     """An action plus optional payload, as emitted by an input backend.
 
-    ``value`` currently only carries the pressed digit for :attr:`Action.DIGIT`
-    events, but exists as a general-purpose slot so future actions can carry
-    data without changing the queue contract.
+    ``value`` carries the pressed digit for :attr:`Action.DIGIT` events.
+
+    ``crt`` carries the settings for :attr:`Action.CRT_PREVIEW`. It is a second
+    slot rather than a reuse of ``value`` because a curvature is not a digit
+    and pretending otherwise would cost the next reader half an hour. Both are
+    immutable, so an event stays safe to hand between the input thread and the
+    main loop.
     """
 
     action: Action
     value: Optional[int] = None
+    crt: Optional[CrtSettings] = None
 
     @classmethod
     def digit(cls, number: int) -> "InputEvent":
@@ -54,4 +93,4 @@ class InputEvent:
         return cls(Action.DIGIT, number)
 
 
-__all__ = ["Action", "InputEvent"]
+__all__ = ["Action", "CrtSettings", "InputEvent"]

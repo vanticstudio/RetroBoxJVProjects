@@ -234,3 +234,79 @@ def test_a_channel_name_yaml_would_misread_survives_as_text(tmp_path, name):
 
     assert load_config(path).channels[0].name == name
     assert yaml.safe_load(path.read_text())["channels"][0]["name"] == name
+
+
+# ==========================================================================
+# Replacing the whole document
+#
+# update() edits a config the box already boots from; replace() is handed a
+# whole document from somewhere else - a file uploaded to the dashboard, or
+# the once-only backup. The dashboard has no authentication, so "somewhere
+# else" means anyone on the LAN, and this is the only path on the box where a
+# stranger's bytes become the file the box boots from. Same rule as update(),
+# and it matters more here: an edit that will not load is a mistake in the
+# code, an upload that will not load is a text file somebody chose.
+#
+# The route in front of this validates too. That is not a reason for the store
+# to skip it - the store is what makes "config.yaml always loads" true for
+# every caller, and a second caller added later gets the guarantee without
+# having to remember it.
+# ==========================================================================
+def test_replacing_the_config_with_one_that_will_not_load_changes_nothing(tmp_path):
+    store, path = _basic(tmp_path)
+    before = path.read_text()
+
+    # Perfectly good YAML. Not a config this box can boot from: two channels
+    # are both channel 2.
+    root = tmp_path / "media"
+    wont_load = (
+        f"media_root: {root}\n"
+        "channels:\n"
+        f"  - {{number: 2, name: One, path: {root / 'sitcoms'}}}\n"
+        f"  - {{number: 2, name: Two, path: {root / 'movies'}}}\n"
+    )
+    assert yaml.safe_load(wont_load), "the test's own sample is not even YAML"
+
+    with pytest.raises(ConfigError):
+        store.replace(wont_load)
+
+    assert path.read_text() == before, (
+        "a config the box cannot boot from was written over the one it could. "
+        "Nobody can reach this box to put it back."
+    )
+    assert [c.name for c in store.load().channels] == ["Sitcoms", "Movies"]
+
+
+def test_replacing_the_config_with_something_that_is_not_yaml_changes_nothing(tmp_path):
+    # What an upload actually looks like when somebody picks the wrong file.
+    store, path = _basic(tmp_path)
+    before = path.read_text()
+
+    with pytest.raises(ConfigError):
+        store.replace("channels: [ this bracket is never closed\n")
+
+    assert path.read_text() == before
+    assert [c.name for c in store.load().channels] == ["Sitcoms", "Movies"]
+
+
+def test_a_replacement_that_does_load_is_written_exactly_as_given(tmp_path):
+    # The other half: refusing everything would be no use. A document that
+    # loads goes down byte for byte, comments and all, because what is being
+    # put back is somebody's own file.
+    root = _media(tmp_path, "sitcoms")
+    store, path = _basic(tmp_path)
+    theirs = (
+        "# my own config, hand written\n"
+        f"media_root: {root}\n"
+        "channels:\n"
+        "  - number: 7\n"
+        "    name: Mine\n"
+        f"    path: {root / 'sitcoms'}\n"
+    )
+
+    returned = store.replace(theirs)
+
+    assert path.read_text() == theirs
+    assert "# my own config, hand written" in path.read_text()
+    assert [c.number for c in returned.channels] == [7]
+    assert [c.name for c in load_config(path).channels] == ["Mine"]

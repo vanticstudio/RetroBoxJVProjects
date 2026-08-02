@@ -221,3 +221,37 @@ def test_an_empty_schedule_is_valid_and_means_no_dayparting():
         "label": "the channel runs as usual all day", "name": None,
         "off_air": False, "path": None,
     }]
+
+
+# ==========================================================================
+# The editor on a box whose own clock is broken
+# ==========================================================================
+# The engine refuses to daypart when it cannot vouch for the clock. The editor
+# is asking a different question - "what WOULD be on at 3am" - and has to keep
+# answering it, or the one screen that could explain the problem goes blank on
+# exactly the boxes that have it.
+def test_the_preview_still_answers_on_a_box_whose_clock_is_not_trusted():
+    from retrobox import daypart
+
+    parts = validate([block("06:00", "12:00", "Mornings"),
+                      block("22:00", "04:00", "After Dark")])
+    daypart.set_clock_trust(lambda: False)
+    try:
+        assert preview_at(parts, 8 * 60)["name"] == "Mornings"
+        assert preview_at(parts, 2 * 60)["name"] == "After Dark"
+        assert preview_at(parts, 15 * 60)["active"] is False
+    finally:
+        daypart.set_clock_trust(None)
+
+
+def test_the_editor_can_say_the_schedule_is_not_being_applied_right_now():
+    """A timeline that looks perfect while the television ignores it is the
+    silent failure all over again, so the editor can ask."""
+    from retrobox.schedule import clock_note
+
+    note = clock_note(epoch=1_277_942_400)      # 2010: a flat CMOS battery
+    assert note["dayparting"] is False
+    assert "2010" in note["reason"]
+    assert "battery" in note["detail"].lower()
+
+    assert clock_note(epoch=time.time())["dayparting"] is True

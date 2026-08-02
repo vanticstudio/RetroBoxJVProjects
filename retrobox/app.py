@@ -22,17 +22,20 @@ import queue
 import random
 import subprocess
 import time
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
-from .actions import Action, InputEvent
+from . import display as display_mod
+from .actions import Action, CrtSettings, InputEvent
 from .channel import Channel, ChannelLineup, PlayRequest, build_lineup, scan_episodes
-from .config import POWER_OFF_COMMANDS, Config, ConfigError, load_config
+from .config import POWER_OFF_COMMANDS, Config, ConfigError, CrtConfig, load_config
+from .input.cec import CEC_ABSENT, CecPower, cec_display_power
 from .input.manager import InputManager, create_backends
 from .menu import MenuContext, MenuModel
 from .overlay import CANVAS_H, CANVAS_W, GuideEntry, OverlayManager, menu_row_at
 from .player import END_EOF, END_ERROR, MockPlayer, Player
-from .status import write_status
+from .status import display_summary, write_status
 from .playlist import ShuffleBag
 from .static_gen import (
     COLORBARS_FILENAME,
@@ -69,9 +72,69 @@ _SPLASH_TIMEOUT_SECONDS = 30.0
 # How often the status snapshot the web dashboard reads is refreshed.
 _STATUS_INTERVAL_SECONDS = 2.0
 
+#: The token used by the hold that a deliberate wake puts on the box - the
+#: dashboard's Wake button, a button pressed on a box that had gone quiet,
+#: and (when there is one) a browser watching the live stream, which sends the
+#: same command over and over as a heartbeat. One token, so a heartbeat
+#: extends the hold rather than stacking a new one up every few seconds.
+WAKE_HOLD_TOKEN = "wake"
+
+#: How long a deliberate wake keeps the box awake for.
+#:
+#: Long on purpose. Somebody pressing Wake is telling us detection got it
+#: wrong, and a box that went straight back to sleep in front of them would be
+#: worse than one that never slept. Half an hour of a fan running is the cheap
+#: mistake; a dark screen somebody cannot fix is the expensive one. Anything
+#: that wants finer control - a live viewer, say - holds the box awake itself
+#: with its own token and its own interval.
+WAKE_HOLD_SECONDS = 30 * 60.0
+
+
+def make_display_watcher(config: Config, **overrides) -> "display_mod.DisplayWatcher":
+    """Build the watcher that answers "is there a television out there?".
+
+    The only place the config's timings meet :mod:`retrobox.display`. The
+    keyword overrides exist for the tests, which hand it a sysfs tree of their
+    own and an event source that only ever waits - this machine has no /sys,
+    no DRM and no netlink, and the suite must never touch any of them.
+    """
+    settings = dict(sleep_after=config.display_sleep.sleep_after_seconds)
+    settings.update(overrides)
+    return display_mod.DisplayWatcher(**settings)
+
 
 class TVApp:
     """The retro-TV application state machine."""
+
+    #: The shortest gap between two changes to the CRT shader, in seconds.
+    #:
+    #: A range input fires per pixel of travel, and every change makes mpv
+    #: write and compile a new GLSL shader - real work on this box's two-core
+    #: Celeron. Five a second is plenty for a value with no correct answer:
+    #: nobody's eye resolves the difference between the 0.31 and the 0.32 they
+    #: swept through on the way to 0.33.
+    #:
+    #: This is a TRAILING throttle, not a dropping one. A value that arrives
+    #: too soon is held, not discarded, and :meth:`step` puts it on the screen
+    #: as soon as the gap has passed - so the value somebody let go of is
+    #: always the value they end up looking at.
+    CRT_THROTTLE_SECONDS = 0.2
+
+    #: How long a preview survives with nothing further heard from whoever
+    #: started it, before the last SAVED settings go back on the screen.
+    #:
+    #: A preview lives in this process and nowhere else, so the three ways
+    #: somebody "walks away" land differently. Switching the box off at the
+    #: wall is free: nothing was written, so the next start reads config.yaml
+    #: and shows what was saved. The dashboard's Cancel button is explicit.
+    #: But a browser tab that closes - or a phone that walks out of wifi range
+    #: mid-drag - says nothing at all, and one line of socket traffic per
+    #: connection means there is no dropped connection to notice either. So
+    #: the box times the preview out for itself. The dashboard is expected to
+    #: re-send the value it is showing every few seconds while its picture
+    #: panel is open; an unchanged value costs nothing (see
+    #: :meth:`_want_crt`), and when the heartbeats stop, so does the preview.
+    CRT_PREVIEW_HOLD_SECONDS = 20.0
 
     def __init__(
         self,
@@ -84,6 +147,9 @@ class TVApp:
         wall_clock: Callable[[], float] = time.time,
         assets_dir: Optional[Path] = None,
         config_path: Optional[Path] = None,
+        display_factory: Optional[
+            Callable[[Config], Optional["display_mod.DisplayWatcher"]]
+        ] = None,
     ) -> None:
         self.config = config
         # Where the config came from, so a `reload` command can go and read it
@@ -148,6 +214,40 @@ class TVApp:
         self._ended: "queue.Queue[str]" = queue.Queue()
         self.player.on_end = self._ended.put
 
+        # Going quiet when there is no television watching.
+        #
+        # `display_factory` is how the watcher gets built, and None means this
+        # process does not watch the display at all - which is what a test
+        # harness wants, and exactly what `display_sleep.enabled: false`
+        # produces. `from_config` supplies the real one, so the box itself
+        # always has it and nothing about that decision is hidden in here.
+        self._display_factory = display_factory
+        self._display_watcher: Optional["display_mod.DisplayWatcher"] = None
+        # The settings the watcher standing there was built from, so a reload
+        # can tell a change that needs a new one from a change that does not.
+        self._display_settings = config.display_sleep
+        # State changes arrive on the WATCHER's thread, so they are queued
+        # exactly like end-of-file and clicks are, and read on our own loop.
+        self._display_events: "queue.Queue[display_mod.DisplaySnapshot]" = queue.Queue()
+        self._display_asleep = False
+        # Wall-clock instant the picture was paused, and where in the episode
+        # it was paused - both only meaningful while asleep.
+        self._display_since: Optional[float] = None
+        self._display_position: Optional[float] = None
+        # Set once detection has been given up on, so it is said exactly once.
+        self._display_broken = False
+        # An episode that reached its end while the box was quiet.
+        self._display_ended = False
+        # WHO IS HOLDING THE BOX AWAKE, AND WHEN EACH HOLD RUNS OUT (monotonic).
+        #
+        # Kept here rather than only in the watcher because the watcher is a
+        # disposable thing: saving any setting throws it away and builds
+        # another, and a hold that lived only in the old one would vanish -
+        # putting the box back to sleep in front of somebody who had just
+        # pressed Wake. This is the book of record; the watcher gets a copy so
+        # its own snapshot tells the truth.
+        self._display_hold_until: Dict[str, float] = {}
+
         # Filler assets.
         self._assets_dir = assets_dir or config.assets_dir or DEFAULT_ASSETS_DIR
         self._colorbars_path = self._resolve_asset(COLORBARS_FILENAME)
@@ -158,6 +258,21 @@ class TVApp:
         self._splash_path = self._resolve_splash()
         self._splash_active = False
         self._splash_deadline: Optional[float] = None
+
+        # The CRT picture effect, which is the one setting somebody adjusts
+        # while looking at the television rather than at the dashboard.
+        #
+        # `_crt_live` is what the picture is actually showing. The player was
+        # built with config.crt baked into its mpv options, so that is where
+        # it starts. `_crt_wanted` is a value that has been asked for but not
+        # yet put on the screen - held back by the throttle, and flushed by
+        # step(). `_crt_preview_until` is the instant an unsaved preview gives
+        # up on whoever started it; None means nothing is being previewed and
+        # the screen is showing saved settings.
+        self._crt_live: CrtConfig = config.crt
+        self._crt_wanted: Optional[CrtConfig] = None
+        self._crt_next_allowed = 0.0
+        self._crt_preview_until: Optional[float] = None
 
         # On-screen menu. `_menu` is None whenever the menu is closed.
         self._menu: Optional[MenuModel] = None
@@ -210,6 +325,10 @@ class TVApp:
         return cls(
             config, player, input_manager,
             assets_dir=assets_dir, config_path=config_path,
+            # The real box always watches the display; whether it acts on what
+            # it sees is `display_sleep.enabled`, checked in one place (see
+            # _start_display_watch) rather than in two.
+            display_factory=make_display_watcher,
         )
 
     # -- lifecycle ----------------------------------------------------------
@@ -230,6 +349,11 @@ class TVApp:
         self._select_start_channel()
         if not self._begin_splash():
             self.tune_current(show_static=False)
+        # Last, and deliberately so: there is a picture on the screen by the
+        # time anything goes looking for a television. A box that starts with
+        # no display attached must come up exactly like any other and go quiet
+        # afterwards, never sit dark waiting to be told what is out there.
+        self._start_display_watch()
 
     # -- boot splash --------------------------------------------------------
     def _resolve_splash(self) -> Optional[Path]:
@@ -287,6 +411,7 @@ class TVApp:
             self.overlay.clear_all()
         except Exception:  # noqa: BLE001
             pass
+        self._stop_display_watch()
         self.input.stop()
         self.player.close()
 
@@ -303,6 +428,11 @@ class TVApp:
         self._maybe_commit_digits(now)
         self._maybe_fire_sleep(now)
         self._maybe_timeout_splash(now)
+        self._maybe_flush_crt(now)
+        # Before the daypart watcher and before the status is written, so that
+        # a box waking up spends no part of a tick half awake: everything
+        # below this line sees a box that is playing again.
+        self._maybe_display_sleep()
         self._update_sleep_indicator()
         self._maybe_retune_daypart()
         self._drain_clicks()
@@ -346,6 +476,32 @@ class TVApp:
         if action == Action.RELOAD:
             self.reload_config()
             return
+        # Also administrative, and also handled up here: somebody is dragging
+        # the curvature slider with the television in front of them, and that
+        # has to work with the menu up, during the splash and in standby -
+        # exactly like a reload does, and for the same reason. Nothing here
+        # touches config.yaml; a preview is only ever on the screen.
+        if action == Action.CRT_PREVIEW:
+            self._preview_crt(event.crt)
+            return
+        if action == Action.CRT_CANCEL:
+            self._cancel_crt_preview()
+            return
+        # Also administrative: the dashboard's Wake button, for when display
+        # detection got it wrong, and the door a live viewer will hold the box
+        # awake through when there is one. It has to work during the splash,
+        # in standby and with the menu open, like the two above.
+        if action == Action.WAKE:
+            self._manual_wake()
+            return
+
+        # Anything else means somebody is pressing buttons, and somebody
+        # pressing buttons is somebody being there. A box that stayed paused
+        # while its owner worked the remote would look broken, and "stuck
+        # asleep" is the one failure this feature is not allowed to have. The
+        # press is not consumed - it still does whatever it was going to do.
+        if self._display_asleep:
+            self._manual_wake()
 
         # Any other button cuts the boot splash short and starts the TV. The
         # press is consumed doing that - nobody wants their first channel-up to
@@ -395,6 +551,488 @@ class TVApp:
             if handler is not None:
                 handler()
 
+    # -- the CRT picture effect, live -------------------------------------
+    def _preview_crt(self, settings: Optional[CrtSettings]) -> None:
+        """Put unsaved picture settings on the television that is playing.
+
+        Merged onto whatever is being previewed already, or onto the saved
+        settings when nothing is: the dashboard sends the control that moved,
+        not the whole panel, so a curvature drag must not quietly undo the
+        scanlines somebody switched off a moment before.
+        """
+        if settings is None:
+            return
+        changes = settings.changes()
+        if not changes:
+            return
+        base = self._crt_wanted if self._crt_wanted is not None else self._crt_live
+        now = self._clock()
+        # Pushed out on every nudge. While somebody is dragging, or while the
+        # dashboard is saying it is still there, the preview never expires.
+        self._crt_preview_until = now + self.CRT_PREVIEW_HOLD_SECONDS
+        self._want_crt(dataclass_replace(base, **changes), now=now)
+
+    def _cancel_crt_preview(self) -> None:
+        """Throw the preview away and put the last SAVED settings back.
+
+        This is the dashboard's Cancel button, and it is also what the box
+        does for itself when a dashboard stops talking to it. It restores the
+        picture, not just the browser: somebody who dragged the slider and
+        changed their mind must not have to save to undo it.
+        """
+        if self._crt_preview_until is None:
+            return                       # nothing was being previewed
+        self._crt_preview_until = None
+        self._want_crt(self.config.crt, now=self._clock())
+
+    def _want_crt(self, crt: CrtConfig, *, now: float) -> None:
+        """Ask for ``crt`` on the screen, subject to the throttle."""
+        self._crt_wanted = crt
+        self._flush_crt(now)
+
+    def _flush_crt(self, now: float) -> None:
+        """Put the wanted settings on the screen if the throttle allows it.
+
+        THIS IS WHERE THE THROTTLE LIVES, and it lives here rather than in the
+        dashboard or in the browser on purpose. This is the last gate before
+        the expensive part - writing a shader file and making mpv compile it -
+        and it is inside the process that owns the player, which is the only
+        way to reach that player at all. A limit in the page's JavaScript
+        protects the box right up until somebody writes to the socket by hand;
+        a limit here holds for every caller there will ever be.
+        """
+        wanted = self._crt_wanted
+        if wanted is None:
+            return
+        if wanted == self._crt_live:
+            # Already on the screen. The dashboard's heartbeat lands here, as
+            # does a slider dragged back to where it started, and neither one
+            # should cost a shader compile.
+            self._crt_wanted = None
+            return
+        if now < self._crt_next_allowed:
+            return                       # too soon; step() will come back for it
+        self._crt_wanted = None
+        # Bumped whether or not the change takes, so a player that is refusing
+        # them (a full cache disk) is asked five times a second at worst.
+        self._crt_next_allowed = now + self.CRT_THROTTLE_SECONDS
+        try:
+            changed = self.player.set_crt(wanted)
+        except Exception:  # noqa: BLE001 - the programme outranks the effect
+            log.warning("could not change the CRT picture effect", exc_info=True)
+            return
+        if changed:
+            self._crt_live = wanted
+        # A player that says no left the picture as it was, so `_crt_live`
+        # stays as it was too - and the next nudge of the slider tries again.
+
+    def _maybe_flush_crt(self, now: float) -> None:
+        """Main-loop half of the throttle, and the preview's own dead-man's switch."""
+        if (self._crt_preview_until is not None
+                and now >= self._crt_preview_until):
+            # Whoever was previewing has gone quiet: a closed tab, a phone out
+            # of range, a socket that dropped mid-drag. None of those tell us
+            # anything, so silence is the signal.
+            log.info("nobody is watching the CRT preview any more; "
+                     "putting the saved picture settings back")
+            self._cancel_crt_preview()
+            return
+        self._flush_crt(now)
+
+    # -- going quiet when there is no television watching -------------------
+    #
+    # WHY THIS EXISTS, and it is not the money. It saves eight or ten watts,
+    # which is about fifteen pounds a year and irrelevant. It exists because a
+    # box in a cabinet behind a television that roars whenever the room is
+    # empty is a thing people complain about, because heat shortens the life of
+    # hardware that is already secondhand, and because silence when the telly
+    # is off is a quality signal somebody notices the first evening they own it.
+    #
+    # THE RULE THAT OUTRANKS ALL OF IT: nothing here may take the picture away
+    # from somebody who is watching. Every unknown, every failure and every
+    # question this cannot answer ends in "stay awake", which is the same
+    # behaviour as the feature being switched off. Being wrong costs a fan
+    # spinning; being wrong the other way costs a customer a dark television
+    # in a box they cannot log into and can only switch off at the wall.
+    @property
+    def display_asleep(self) -> bool:
+        """True when the picture is paused because nothing is watching."""
+        return self._display_asleep
+
+    def _start_display_watch(self) -> None:
+        """Begin watching the video output, if this box does that at all."""
+        if self._display_watcher is not None:
+            return
+        if self._display_factory is None or not self.config.display_sleep.enabled:
+            return
+        watcher = None
+        try:
+            watcher = self._display_factory(self.config)
+            if watcher is None:
+                self._display_gave_up("there is no way to detect a display on this box")
+                return
+            # The callback runs on the watcher's thread, so it does exactly
+            # what the player's end-of-file callback does: puts the snapshot
+            # on a queue and gets out of the way.
+            watcher.on_change = self._display_events.put
+            watcher.start()
+        except Exception:  # noqa: BLE001 - video first, always
+            self._display_gave_up("display detection could not be started", exc=True)
+            if watcher is not None:
+                try:
+                    watcher.stop()
+                except Exception:  # noqa: BLE001
+                    log.debug("stopping the failed display watcher failed", exc_info=True)
+            return
+        self._display_settings = self.config.display_sleep
+        self._display_watcher = watcher
+        # Hand the new watcher the holds that are still live. Without this a
+        # saved setting silently cancels somebody's Wake, because the watcher
+        # it was taken on has just been thrown away.
+        self._replay_holds(watcher)
+
+    def _replay_holds(self, watcher) -> None:
+        now = self._clock()
+        for token, until in self._live_hold_deadlines(now):
+            try:
+                watcher.hold_awake(token, until - now)
+            except Exception:  # noqa: BLE001 - a hold we cannot copy is still ours
+                log.debug("could not carry a hold over to the new watcher", exc_info=True)
+
+    def _live_hold_deadlines(self, now: float) -> tuple:
+        """The holds that have not run out, dropping the ones that have."""
+        for token in [t for t, until in self._display_hold_until.items() if until <= now]:
+            del self._display_hold_until[token]
+        return tuple(sorted(self._display_hold_until.items()))
+
+    def _stop_display_watch(self) -> None:
+        watcher = self._display_watcher
+        self._display_watcher = None
+        if watcher is None:
+            return
+        try:
+            watcher.stop()
+        except Exception:  # noqa: BLE001 - never hold up a shutdown
+            log.debug("stopping the display watcher failed", exc_info=True)
+
+    def _display_gave_up(self, why: str, *, exc: bool = False) -> None:
+        """Switch the feature off for this run, and say so exactly once.
+
+        Once is the point for the LOG LINE. This runs on a two-core box that
+        logs to eMMC, and a failure that repeats every tick would fill the
+        journal and wear the disk to tell somebody the same thing several
+        thousand times.
+
+        THE WAKE IS NOT ONCE, AND COMES FIRST. Giving up drops the watcher,
+        and _maybe_display_sleep returns on its first line without one - so
+        anything left paused at this moment would stay paused for ever, in
+        front of a working television, with a dashboard reporting no fault.
+        The log line already promises the box will stay awake; this is the
+        line that makes that true rather than a claim.
+        """
+        self._display_watcher = None
+        self._wake_display(why)
+        if self._display_broken:
+            return
+        self._display_broken = True
+        log.warning(
+            "%s - the box will stay awake and will not go quiet on its own", why,
+            exc_info=exc,
+        )
+
+    def apply_display_sleep_setting(self) -> None:
+        """Take up a change to the ``display_sleep`` block, mid-programme.
+
+        Switching it OFF happens at once and in the safe direction: the
+        watcher stops and anything it paused is put back on the screen.
+        Switching it on, or changing how long the display has to have been
+        gone, needs a new watcher - the debounce is baked in when one is built.
+        """
+        settings = self.config.display_sleep
+        if not settings.enabled:
+            self._display_settings = settings
+            self._stop_display_watch()
+            self._wake_display("going quiet was switched off")
+            return
+        if self._display_watcher is not None and settings == self._display_settings:
+            return                       # nothing that needs a new watcher
+        self._stop_display_watch()
+        self._display_settings = settings
+        self._start_display_watch()
+
+    # -- the seam for anything else that is watching ------------------------
+    # There is no live stream viewer yet - that work stopped at a hardware
+    # gate - so nothing in this process calls these. They exist so that when
+    # there is one, a browser watching counts as watching: it holds the box
+    # awake with its own token, repeated as a heartbeat, and a tab closed on a
+    # train stops holding it of its own accord. The dashboard's Wake button
+    # goes through exactly the same door (see WAKE_HOLD_TOKEN).
+    def hold_awake(self, token: str, seconds: Optional[float] = None) -> bool:
+        """Keep the box awake under ``token`` for ``seconds``, and wake it now.
+
+        Returns False only when this process is not in the display-sleep
+        business at all - the feature switched off, or no factory to build a
+        watcher with - because then there is nothing a hold could be holding
+        back. A watcher that is momentarily absent is NOT that case: the hold
+        is written down here either way, so it outlives a rebuild and so it
+        still counts while detection is being given up on.
+
+        Calling again with the same token extends that one hold rather than
+        stacking another up, so a heartbeat is just the same call again.
+        """
+        if self._display_factory is None or not self.config.display_sleep.enabled:
+            return False
+        span = (
+            display_mod.HOLD_SECONDS if seconds is None else max(0.0, float(seconds))
+        )
+        self._display_hold_until[token] = self._clock() + span
+        watcher = self._display_watcher
+        if watcher is not None:
+            try:
+                watcher.hold_awake(token, span)
+            except Exception:  # noqa: BLE001 - our own record is the one that counts
+                log.debug("could not take a hold on the display watcher", exc_info=True)
+        return True
+
+    def release_hold(self, token: str) -> None:
+        """Give up a hold early. Harmless if there was never one."""
+        self._display_hold_until.pop(token, None)
+        watcher = self._display_watcher
+        if watcher is None:
+            return
+        try:
+            watcher.release_hold(token)
+        except Exception:  # noqa: BLE001
+            log.debug("could not release a hold on the display watcher", exc_info=True)
+
+    # -- deciding, once a tick ---------------------------------------------
+    def _maybe_display_sleep(self) -> None:
+        """Should this box be awake at all?
+
+        Asked every tick, not only when the watcher pushes a change. A hold
+        running out is edge-free - nobody is there to announce it - and the
+        television's own word about its power arrives over CEC on a different
+        thread entirely, so the polled question is the authoritative one and
+        the pushed events are only how the journal gets the detail.
+        """
+        watcher = self._display_watcher
+        if watcher is None:
+            return
+        self._drain_display_events()
+        try:
+            power = self._cec_power()
+            awake = self._wants_awake(watcher, power)
+        except Exception:  # noqa: BLE001 - the programme outranks the feature
+            # Giving up wakes the box itself - it has to, because it is also
+            # reached from a rebuild that failed, where nothing else would.
+            self._display_gave_up("display detection stopped working", exc=True)
+            return
+
+        if awake:
+            self._wake_display("something is watching again")
+            return
+
+        # From here on this tick intends to leave the box quiet, so this is
+        # where the second opinion belongs.
+        #
+        # BELT AND BRACES, AND THE BRACES ARE THE POINT. Stuck asleep in front
+        # of a working television is strictly worse than never sleeping at
+        # all, and it is the one outcome nobody can recover from without
+        # switching the box off at the wall. So it is checked for with a
+        # different question than the one that decided to sleep, rather than
+        # trusted to fall out of the state machine being right. A set in
+        # standby commonly keeps hotplug asserted, so a live cable only counts
+        # as a television watching while CEC is not saying otherwise.
+        if (self._display_asleep and watcher.state == display_mod.PRESENT
+                and not power.says_off):
+            log.error(
+                "the box was asleep with a display connected - waking it. That "
+                "should not be reachable, so something above this is wrong."
+            )
+            self._wake_display("a display is connected after all")
+            return
+        if self._display_asleep or not self._may_go_quiet():
+            return
+        self._sleep_display(watcher, power)
+
+    def _wants_awake(self, watcher, power: CecPower) -> bool:
+        """Is anything at all asking this box to stay awake?
+
+        THIS DOES NOT DECIDE ANYTHING ITSELF. It gathers the three inputs and
+        hands them to :func:`retrobox.display.wants_awake`, which is the one
+        and only place the precedence between them is written down - the same
+        function the watcher's own ``should_be_awake`` goes through. Two
+        implementations of one question drift apart, and the drift shows up as
+        a box that goes quiet in front of somebody. So there is one.
+
+        What this layer adds over the watcher is the television's own word:
+        HDMI-CEC lives in the input backends, which the watcher cannot see.
+        """
+        return display_mod.wants_awake(
+            holds=bool(self._display_holds(watcher)),
+            wire_awake=watcher.should_be_awake(),
+            set_is_off=power.says_off if power.is_known else None,
+        )
+
+    def _display_holds(self, watcher) -> tuple:
+        """Everything currently holding the box awake, from both books.
+
+        Ours is the book of record - it is the one that survives a watcher
+        being rebuilt, and the one that still exists when there is no watcher.
+        The watcher's is folded in as well because a hold this process never
+        heard about is still a reason not to take somebody's picture away.
+        """
+        holds = set(dict(self._live_hold_deadlines(self._clock())))
+        try:
+            holds.update(watcher.snapshot().holds)
+        except Exception:  # noqa: BLE001 - a watcher that cannot say is not a veto
+            log.debug("could not read the watcher's holds", exc_info=True)
+        return tuple(sorted(holds))
+
+    def _cec_power(self) -> CecPower:
+        """What HDMI-CEC says about the television, if this box has any."""
+        try:
+            return cec_display_power(self.input.backends)
+        except Exception:  # noqa: BLE001
+            log.debug("could not read the CEC power state", exc_info=True)
+            return CecPower(CEC_ABSENT, None, "the CEC backend could not be read")
+
+    def _may_go_quiet(self) -> bool:
+        """Whether now is a sensible moment to pause - not whether to."""
+        if self.standby or self.powered_off:
+            return False    # the picture is already off; there is nothing to save
+        if self._splash_active:
+            return False    # never in front of the first video
+        if self._menu is not None:
+            return False    # the menu already paused playback for its own reasons
+        if self._switch_deadline is not None:
+            return False    # mid channel-change; let it land first
+        return True
+
+    def _drain_display_events(self) -> None:
+        """Write down what the watcher pushed while we were busy elsewhere."""
+        while True:
+            try:
+                snapshot = self._display_events.get_nowait()
+            except queue.Empty:
+                return
+            log.info(
+                "the video output is now %s (%s)", snapshot.state, snapshot.detail
+            )
+
+    # -- going quiet, and coming back --------------------------------------
+    def _sleep_display(self, watcher, power: CecPower) -> None:
+        """PAUSE. Never stop, and never tear the player down.
+
+        Pausing drops decoding to nothing, which is all of the heat and all of
+        the fan, while mpv stays alive holding the file it had open. The
+        dashboard stays accurate, the file share keeps running, and coming
+        back is instant. Stopping and reloading mpv would be slow, would lose
+        everything about where we were, and would spend one of the restarts
+        systemd is willing to allow before it gives up on the unit entirely.
+        """
+        self._display_position = self.player.get_time_pos()
+        try:
+            self.player.set_paused(True)
+        except Exception:  # noqa: BLE001 - a player that will not pause keeps playing
+            log.warning("could not pause the picture; staying awake", exc_info=True)
+            self._display_position = None
+            return
+        self._display_asleep = True
+        self._display_since = self._wall_clock()
+        if power.says_off:
+            why = power.detail
+        else:
+            try:
+                why = watcher.snapshot().detail
+            except Exception:  # noqa: BLE001
+                why = "nothing is watching"
+        log.info("nothing is watching (%s); pausing the picture", why)
+
+    def _wake_display(self, why: str) -> None:
+        """Undo exactly what going quiet did, and put the right thing back on."""
+        if not self._display_asleep:
+            return
+        since = self._display_since
+        position = self._display_position
+        self._display_asleep = False
+        self._display_since = None
+        self._display_position = None
+        slept = max(0.0, self._wall_clock() - since) if since is not None else 0.0
+        # Unconditionally, and before anything else can go wrong: whatever the
+        # rest of this decides, the picture must never be left paused.
+        try:
+            self.player.set_paused(False)
+        except Exception:  # noqa: BLE001
+            log.warning("could not un-pause the picture", exc_info=True)
+        log.info("waking up: %s (quiet for %d seconds)", why, int(slept))
+        self._resume_after_sleep(slept, position)
+
+    def _resume_after_sleep(self, slept: float, position: Optional[float]) -> None:
+        """Put back what should be on the screen now - rarely the paused frame.
+
+        THIS IS THE PART THAT MATTERS MOST, and it is one line away from being
+        wrong. A broadcast channel is a notional station that never stopped
+        transmitting: :meth:`BroadcastSchedule.at` works out what is airing
+        from the wall clock, so RE-TUNING lands exactly where the broadcast
+        has got to. Calling un-pause and stopping there would resume three
+        hours behind, and the illusion that the station kept going while the
+        room was empty - which is the entire product - would be gone.
+
+        A channel in `random` or `resume` mode has no schedule to recompute
+        from, so the choice is the owner's and lives in the config. See
+        :class:`~retrobox.config.DisplaySleepConfig` for the two answers and
+        why `resume` is the default.
+        """
+        ended = self._display_ended
+        self._display_ended = False
+        if self.standby or self._splash_active or self._menu is not None:
+            return
+        if self.config.tune_in == "broadcast":
+            self.tune_current(show_static=False)
+            return
+        if ended:
+            # The episode ran out while nobody was watching, whatever the
+            # setting says - there is no paused frame left to carry on from.
+            self._advance_current()
+            return
+        if self.config.display_sleep.non_broadcast != "advance":
+            return                     # `resume`: the paused frame is the right one
+        self._advance_by(slept, position)
+
+    def _advance_by(self, slept: float, position: Optional[float]) -> None:
+        """Skip forward by however long the box was quiet, for `advance` mode."""
+        path = self._playing_path
+        if path is None or slept <= 0:
+            return
+        target = (position or 0.0) + slept
+        duration = self._known_duration()
+        if duration is not None and target >= duration:
+            # It ran out while nobody was watching, so roll on exactly as an
+            # ended episode does - but with no station bumper, because a
+            # bumper is for a gap somebody is sitting through.
+            request = self.lineup.current.advance()
+            if request is None:
+                self._show_no_signal(self.lineup.current)
+            else:
+                self._play_request(request)
+            return
+        # A duration we never learned is not a reason to refuse: mpv asked to
+        # start past the end of a file reports end-of-file, and that rolls the
+        # channel on by the ordinary path.
+        self._play_request(PlayRequest(path=path, start=target))
+
+    def _manual_wake(self) -> None:
+        """Wake because somebody said so, and keep it awake for a while.
+
+        The hold matters as much as the wake. Without it the very next tick
+        would look at a television still reporting itself absent and put the
+        box straight back to sleep, which is exactly the experience somebody
+        pressing Wake is complaining about.
+        """
+        self.hold_awake(WAKE_HOLD_TOKEN, seconds=WAKE_HOLD_SECONDS)
+        self._wake_display("somebody asked for it")
+
     # -- reloading ----------------------------------------------------------
     def reload_config(self) -> bool:
         """Re-read the config file and rebuild the lineup, mid-programme.
@@ -409,9 +1047,10 @@ class TVApp:
         the film someone else is halfway through.
 
         Some of the config is welded in when the process starts and cannot be
-        picked up here: the CRT shader, the 4:3 letterboxing and which input
-        backends exist are all handed to mpv and to the input manager once. The
-        dashboard knows this and says so rather than pretending.
+        picked up here: the 4:3 letterboxing and which input backends exist are
+        handed to mpv and to the input manager once. The dashboard knows this
+        and says so rather than pretending. The CRT effect used to be on that
+        list; it is not any more - see the shader block below.
         """
         if self._config_path is None:
             log.info("reload asked for, but this app was not built from a config file")
@@ -436,6 +1075,34 @@ class TVApp:
         self._bumper_rng = random.Random(config.shuffle_seed)
         self._bumpers = self._load_bumpers()
         self._transition_path = self._resolve_transition_asset()
+
+        # A save ends any preview: what was just written to config.yaml is the
+        # truth now, whatever a slider happened to be showing. This has to run
+        # even when the crt block itself did not change - somebody renaming a
+        # channel while a preview is up must not have that preview quietly
+        # promoted to permanent.
+        self._crt_preview_until = None
+        self._crt_wanted = None
+        if config.crt != self._crt_live:
+            # Curvature is a taste setting with no correct value: the only way
+            # anyone sets it sensibly is by dragging the dashboard slider while
+            # watching the television. So it goes onto the live picture here
+            # rather than waiting for a restart nobody is going to do twice.
+            #
+            # Compared against what the SCREEN is showing, not against the
+            # config we were running: saving the value that was already being
+            # previewed leaves the picture exactly right, and re-applying it
+            # would make mpv recompile the same shader for no visible change.
+            #
+            # A save goes on immediately, throttle or no throttle. It is one
+            # deliberate press of a button, not a slider firing, and it is the
+            # moment the customer is told "saved" - so it has to be true by
+            # the time they look up.
+            try:
+                if self.player.set_crt(config.crt):
+                    self._crt_live = config.crt
+            except Exception:  # noqa: BLE001 - the programme outranks the effect
+                log.warning("could not change the CRT picture effect", exc_info=True)
 
         if config.audio_device and config.audio_device != self._audio_device:
             self._audio_device = config.audio_device
@@ -469,6 +1136,10 @@ class TVApp:
         if self._menu is not None:
             self._menu.context = self._menu_context()
             self._draw_menu()
+
+        # Last, so that switching going-quiet off - which puts the picture
+        # back - does not fight the retune above.
+        self.apply_display_sleep_setting()
 
         log.info(
             "config reloaded from %s: %d channels", self._config_path, len(self.lineup)
@@ -702,6 +1373,13 @@ class TVApp:
                 # The splash played out on its own; start the TV proper.
                 self._finish_splash()
                 advanced = True
+            elif self._display_asleep:
+                # An end-of-file that was already in flight when the picture
+                # was paused. Rolling the next episode now would start
+                # decoding for nobody, which is the whole thing we just
+                # stopped doing - so it is remembered and dealt with on the
+                # way back (see _resume_after_sleep).
+                self._display_ended = True
             # Coalesce: only advance once even if several events queued up.
             elif not advanced and not self.standby:
                 self._advance_current()
@@ -830,7 +1508,12 @@ class TVApp:
         """React to a daypart window opening or closing under the current show."""
         # Not while the menu is up: retuning would resume playback behind it.
         # The marker is left untouched, so the change is picked up on close.
-        if self.standby or self._menu is not None or self._switch_deadline is not None:
+        # Nor while the box has gone quiet - a daypart opening at ten o'clock
+        # in an empty room must not start the box decoding for nobody. Same
+        # reasoning, same fix: the marker is left alone and the change is
+        # picked up the moment somebody is watching again.
+        if (self.standby or self._display_asleep
+                or self._menu is not None or self._switch_deadline is not None):
             return
         channel = self.lineup.current
         if not channel.config.dayparts:
@@ -875,6 +1558,7 @@ class TVApp:
             "menu_open": self._menu is not None,
             "audio_device": self._audio_device,
             "hwdec": self.player.get_hwdec(),
+            "display": self._display_status(),
             "sleep_minutes": (
                 None if remaining is None
                 else int(remaining // 60) + (1 if remaining % 60 else 0)
@@ -894,6 +1578,82 @@ class TVApp:
                 "recent": self.input.recent(),
             },
         }
+
+    def _display_status(self) -> dict:
+        """Whether the box is playing or has gone quiet, and why.
+
+        Everything the dashboard needs to say so without inventing wording,
+        including the finished sentence itself (see
+        :func:`retrobox.status.display_summary`). A box that has gone quiet is
+        WORKING: nothing in here may be rendered as a fault.
+        """
+        settings = self.config.display_sleep
+        watcher = self._display_watcher
+        power = self._cec_power()
+        block = None
+        if watcher is not None:
+            try:
+                block = watcher.snapshot().as_dict()
+            except Exception:  # noqa: BLE001 - the dashboard never outranks the video
+                # A watcher that cannot describe itself must not take the
+                # television down with it: this runs inside step().
+                log.debug("the display watcher could not describe itself", exc_info=True)
+        if block is None:
+            # Not watching, or not able to say: either switched off, detection
+            # that could not be made to work here, or a watcher that blew up.
+            # All of them mean the box simply stays awake.
+            block = {
+                "state": display_mod.UNKNOWN,
+                "awake": True,
+                "description": display_mod.describe(display_mod.UNKNOWN),
+                "caveat": display_mod.CAVEAT,
+                "mode": display_mod.MODE_STOPPED,
+                "mode_detail": "the display is not being watched",
+                "detail": "",
+                "connectors": [],
+                "holds": [],
+                "changed_at": 0.0,
+            }
+        # Both books, exactly as the arbitration reads them - so what the
+        # dashboard shows is what the box is actually acting on, including the
+        # holds that survived a watcher being rebuilt or that outlived one.
+        mine = dict(self._live_hold_deadlines(self._clock()))
+        block["holds"] = sorted(set(block["holds"]) | set(mine))
+        block.update({
+            # Whether this box is watching at all, which is the setting AND
+            # detection having worked. `configured` is what config.yaml says,
+            # so a dashboard can tell "switched off" from "could not".
+            "enabled": watcher is not None,
+            "configured": settings.enabled,
+            "sleeping": self._display_asleep,
+            "asleep_seconds": (
+                round(max(0.0, self._wall_clock() - self._display_since), 1)
+                if self._display_since is not None else 0.0
+            ),
+            # WHETHER TO OFFER THE WAKE BUTTON, and it must never be tied to
+            # the watcher alone. A paused picture is always wakeable - waking
+            # is un-pausing, which needs no watcher at all - and the moment
+            # the button matters most is exactly the moment detection has
+            # fallen over. Hiding the fix precisely when the fix is needed
+            # leaves a physical remote as the only way back into a box nobody
+            # can log into.
+            "can_wake": watcher is not None or self._display_asleep,
+            "sleep_after_seconds": settings.sleep_after_seconds,
+            "non_broadcast": settings.non_broadcast,
+            "cec": {
+                "state": power.state,
+                "detail": power.detail,
+                "says_off": power.says_off,
+            },
+        })
+        block["summary"] = display_summary(
+            sleeping=self._display_asleep,
+            enabled=watcher is not None,
+            state=str(block["state"]),
+            cec=power.state,
+            holds=list(block["holds"]),
+        )
+        return block
 
     def _known_duration(self) -> Optional[float]:
         if self._playing_path is None:

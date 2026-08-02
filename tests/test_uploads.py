@@ -8,6 +8,7 @@ something goes wrong halfway through.
 
 import errno
 import io
+import json
 import os
 import pathlib
 import threading
@@ -710,6 +711,80 @@ def test_a_commit_cut_off_half_way_finishes_on_the_retry(
 
     assert [r.state for r in results] == ["done", "done"]
     assert (channel_dir / "ep2.mp4").read_bytes() == payload
+
+
+# ==========================================================================
+# The note comes before the move, and the order is the whole of the trick
+#
+# Landing a file is two steps that cannot be made one: write down that this
+# episode is ours, and rename it into the channel. This box is switched off at
+# the wall, so the power can go between them - and which step went first
+# decides what the box says on the way back up. Note first, and a cut leaves a
+# note about a file that never arrived, which costs nothing: the retry finds no
+# file at the destination and simply lands it. Move first, and a cut leaves the
+# customer's own episode sitting in the channel with nothing claiming it, so
+# the retry meets it as a stranger's file and refuses to touch it - telling
+# them their upload was skipped as a duplicate of itself.
+# ==========================================================================
+def test_the_note_that_a_file_is_ours_is_on_disk_before_the_file_is_moved(
+    store, channel_dir, monkeypatch
+):
+    payload = b"\x15" * 100
+    session = store.create(target(channel_dir), [("ep1.mp4", len(payload))])
+    send(store, session, 0, split(payload))
+
+    manifest = store._manifest_path(session.id)
+    said_at_the_move = []
+    real_move = UploadStore._move_into_place
+
+    def move(self, assembled, destination):
+        # What is durably on the disk at the instant the rename happens - not
+        # what is in memory, which a power cut takes with it.
+        recorded = json.loads(manifest.read_text(encoding="utf-8"))
+        said_at_the_move.append(recorded["files"][0]["landed"])
+        return real_move(self, assembled, destination)
+
+    monkeypatch.setattr(UploadStore, "_move_into_place", move)
+    store.commit(session.id)
+
+    assert said_at_the_move == [True], (
+        "the episode was moved into the channel before anything on disk said "
+        "it was ours, so a cut in that window loses the claim for good"
+    )
+
+
+def test_a_box_switched_off_between_the_note_and_the_move_still_calls_the_file_its_own(
+    store, channel_dir, monkeypatch
+):
+    payload = b"\x16" * 100
+    session = store.create(target(channel_dir), [("ep1.mp4", len(payload))])
+    send(store, session, 0, split(payload))
+
+    real_move = UploadStore._move_into_place
+    gone = []
+
+    def the_power_goes_the_instant_it_lands(self, assembled, destination):
+        real_move(self, assembled, destination)
+        if not gone:
+            gone.append(True)
+            raise RuntimeError("the box went off at the wall")
+
+    monkeypatch.setattr(UploadStore, "_move_into_place",
+                        the_power_goes_the_instant_it_lands)
+    with pytest.raises(RuntimeError):
+        store.commit(session.id)
+    assert (channel_dir / "ep1.mp4").read_bytes() == payload, \
+        "the episode never landed, so this proves nothing about the note"
+
+    # The box comes back up and the browser finishes the upload again. Every
+    # answer now comes from what survived on the disk.
+    result = store.commit(session.id)[0]
+
+    assert result.state == "done", (
+        f"the box called the customer's own episode somebody else's and left "
+        f"the upload looking failed: {result.state} - {result.detail!r}"
+    )
+    assert (channel_dir / "ep1.mp4").read_bytes() == payload
 
 
 def test_a_file_that_appeared_while_the_upload_ran_is_not_called_a_duplicate(

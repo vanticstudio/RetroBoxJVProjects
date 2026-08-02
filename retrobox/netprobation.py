@@ -13,7 +13,27 @@ configuration back by itself.
 
 Our own netplan files are a separate matter - netplan reverts what it
 *applied*, not what we wrote to disk - so the previous contents are recorded
-before anything is written and restored when the window closes.
+before anything is written, restored when the window closes, and then *put
+into effect*: netplan reads /etc/netplan at boot and when it is told to, so a
+file put back and nothing more leaves the box running the settings nobody
+wanted for the rest of the session.
+
+The promise runs both ways, and the second half is as load-bearing as the
+first. No path here ends with an unconfirmed change still in place - and no
+path takes away a change somebody confirmed. That second one is why keeping
+is written down *before* the newline that commits it: pressing ENTER cannot
+be taken back, so a box that records it afterwards can lose the record to a
+full disk and undo, at the next start-up, a change the customer explicitly
+kept. A box that cannot write the record does not press ENTER at all.
+
+Which leaves one record that is a statement of intent rather than of fact: a
+box found saying "keeping" cannot prove the newline was ever delivered. It is
+not guessed at either way. The netplan files are what survives, every path
+that gets that far has finished with them, and so whichever configuration is
+in ``/etc/netplan`` is the one that was settled on - the box is made to run
+it and told which of the two it was. When they cannot be read, nothing can
+say, and nothing that cannot say gets to call a change kept: unsure means
+back on the previous settings. See :meth:`Probation._settle_interrupted`.
 
 The whole flow, from the user's side:
 
@@ -45,6 +65,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from . import netconf
 from .netconf import NetworkError
 
 log = logging.getLogger(__name__)
@@ -117,6 +138,51 @@ _HANDLES = itertools.count(1)
 #: would each record the *other's* freshly written file as the way back, and
 #: then there would be no way back at all.
 _CHANGE = threading.RLock()
+
+
+#: Said when the files went back but the box could not be made to use them.
+#: It is not a failure - the undo happened, and the next start-up picks it up -
+#: so it is added to the message rather than replacing it.
+NOT_IN_EFFECT = (
+    "This box could not put them into effect straight away, so switch it off "
+    "and on again if it still cannot be reached."
+)
+
+#: Said when a keep the box had to finish for itself is on the disk but is not
+#: what the box is running yet. It replaces the plain "these are the box's
+#: settings now" rather than being added to it, because that sentence and this
+#: one cannot both be true - and the page renders this one, since switching
+#: the box off and on again is the whole of the fix and nothing else is going
+#: to say so.
+KEPT_NOT_IN_EFFECT = (
+    "Kept, but this box could not start using those settings straight away. "
+    "Switch it off and on again if it is not on them yet."
+)
+
+
+def _put_into_effect() -> str:
+    """Make the files that were just put back the ones the box is running.
+
+    Never raises, and never turns a successful undo into a failure. netplan
+    reads /etc/netplan at boot and when it is told to, so restoring the file
+    is only half the job: without this the box keeps running the configuration
+    nobody wanted until it is next switched off at the wall, which on a box
+    that configuration has taken off the network means until somebody carries
+    a keyboard to it.
+
+    Returns what to add to the message, which is nothing at all when it worked.
+    """
+    try:
+        netconf.apply_plan()
+    except AssertionError:
+        # The test suite's guard against a command that would touch the real
+        # machine. It must stay loud rather than becoming a log line.
+        raise
+    except Exception:  # noqa: BLE001 - the files are back either way
+        log.warning("could not put the restored network configuration into effect",
+                    exc_info=True)
+        return NOT_IN_EFFECT
+    return ""
 
 
 def _forget(handle: Optional[str]) -> None:
@@ -277,7 +343,14 @@ class Probation:
         except OSError:
             log.warning("could not make %s private", self.state_path, exc_info=True)
 
-    def _save(self, data: Dict[str, Any], *, must: bool = False) -> None:
+    def _save(self, data: Dict[str, Any], *, must: bool = False) -> bool:
+        """Write the record down. Says whether it landed.
+
+        Callers that are about to do something disruptive use that answer: a
+        box that cannot write the record is a box that will find the same
+        change waiting the next time anybody looks, and do the same thing
+        again, and again.
+        """
         from .configwrite import atomic_write_text
 
         self._make_private()
@@ -293,6 +366,8 @@ class Probation:
                     "change, so it has not made one"
                 ) from None
             log.warning("could not record the network change", exc_info=True)
+            return False
+        return True
 
     def state(self) -> Dict[str, Any]:
         """What is happening, and revert if the window has closed.
@@ -304,6 +379,12 @@ class Probation:
         """
         with _CHANGE:
             data = self._load()
+            if data.get("phase") == "keeping":
+                # The box stopped between writing down that it was keeping the
+                # change and netplan taking it - or the write that should have
+                # recorded what happened next never landed. Either way this
+                # record is a statement of intent, not of fact.
+                return self._public(self._settle_interrupted(data))
             if data.get("phase") != "testing":
                 return self._public(data)
 
@@ -465,22 +546,158 @@ class Probation:
                 # the old ones - the one lie this module must never tell.
                 self._undo(data, gone)
                 raise NetworkError(gone)
+
+            # Written down BEFORE the newline goes to netplan, and it has to
+            # land. Pressing ENTER commits the configuration and cannot be
+            # taken back, so a record written afterwards is a record that can
+            # be lost after the fact - a full disk, a read-only root - leaving
+            # one that still says "testing" over a change netplan has already
+            # made permanent. The next start-up reads that and puts back
+            # settings the customer explicitly kept, which is this module
+            # breaking its own promise in the direction nobody is watching.
+            committing = dict(data)
+            committing["phase"] = "keeping"
+            committing["message"] = "Keeping these settings."
+            try:
+                self._save(committing, must=True)
+            except NetworkError:
+                # It cannot be recorded, so it must not be done. Nothing has
+                # happened yet: netplan still has the old configuration to go
+                # back to, and unsure always means back on this box.
+                cannot_write = (
+                    "This box could not write down that you kept those "
+                    "settings, so it has put the previous ones back rather "
+                    "than make a change it has no record of. Try again."
+                )
+                self._undo(data, cannot_write)
+                raise NetworkError(cannot_write) from None
+
             try:
                 self._trier.confirm(data.get("handle"))
             except NetworkError:
                 log.warning("could not confirm the network change", exc_info=True)
+                # `data` still carries the way back; `committing` is only the
+                # copy that went to the disk.
                 self._undo(data, gone)
                 raise NetworkError(gone) from None
 
-            data.update({
-                "phase": "kept", "finished_at": self._clock(),
-                "message": "Kept. These are the box's settings now.",
-            })
-            # There is nothing left to go back to, so the copy of the old wifi
-            # file - password and all - has no reason to stay on the disk.
-            data.pop("previous", None)
-            self._save(data)
-            return self._public(data)
+            return self._public(self._settle_kept(
+                committing, "Kept. These are the box's settings now."
+            ))
+
+    def _settle_interrupted(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Finish a keep that stopped part-way, by reading the disk not guessing.
+
+        "keeping" is written down *before* the newline that commits the
+        change, so a record that still says it cannot prove the newline was
+        ever delivered. Both guesses do harm. Calling it kept tells somebody
+        their settings were saved when the box may have put the old ones back -
+        which is what happens when the newline could not be delivered, because
+        the undo that follows puts the netplan files back and only then writes
+        down that it did, and on a box whose disk is full that last write is
+        exactly the one that fails. Calling it reverted takes away a change
+        somebody explicitly asked for, which is the thing writing "keeping"
+        early exists to prevent.
+
+        So it does not guess. Every path that reaches here has already
+        finished with the netplan files, and the files are what survives a box
+        going off at the wall: a keep that went through left the new
+        configuration in /etc/netplan, and an undo left the previous one. So
+        whichever is there is the one that was settled on - and the box is
+        made to actually run it, because netplan reads /etc/netplan at boot
+        and when it is told to and at no other time.
+
+        When the files cannot be read, nothing can say which of the two it is,
+        and there is no reading of "cannot tell" that justifies telling
+        somebody a change was kept. Unsure means back on the previous
+        settings, always: they are the ones known to work.
+        """
+        previous = data.get("previous") or {}
+        if not self._new_configuration_is_still_there(previous):
+            log.warning(
+                "this box stopped part-way through keeping a network change "
+                "and its netplan files are not holding it - putting the "
+                "previous settings back"
+            )
+            return self._undo(data, (
+                "This box stopped part-way through keeping those settings, so "
+                "it has gone back to the previous ones rather than claim a "
+                "change it cannot account for. Nothing was lost - try again."
+            ))
+
+        log.warning(
+            "this box stopped while keeping a network change - its netplan "
+            "files hold the new configuration, so it stands as kept"
+        )
+        return self._settle_kept(
+            data, "Kept. These are the box's settings now.", into_effect=True,
+        )
+
+    def _new_configuration_is_still_there(
+        self, previous: Dict[str, Optional[str]]
+    ) -> bool:
+        """Is /etc/netplan still holding the change, rather than the way back?
+
+        Only ever true when every file could be read and at least one of them
+        differs from what the record says was there before. A file that would
+        not read, or a record with no way back in it at all, answers no.
+        """
+        if not previous:
+            return False
+        changed = False
+        for path, was in previous.items():
+            try:
+                now = self._read(path)
+            except Exception:  # noqa: BLE001 - unreadable is unreadable
+                log.warning("could not read %s to settle a keep", path, exc_info=True)
+                return False
+            if now is None:
+                return False
+            # A file that did not exist before is put back by emptying it -
+            # an unprivileged process cannot delete a root-owned one - so an
+            # empty document is what "it was not there" looks like afterwards.
+            if now != (was if was is not None else EMPTY_PLAN):
+                changed = True
+        return changed
+
+    def _settle_kept(self, data: Dict[str, Any], message: str, *,
+                     into_effect: bool = False) -> Dict[str, Any]:
+        """Finish a keep: it is in place, and nothing may take it away now.
+
+        The save here is deliberately not ``must``. The record already says
+        the change is being kept, and that is the answer a later start-up
+        needs; this only tidies the wording and drops the way back. A box that
+        cannot write it is a box that says "keeping" for ever, which is
+        untidy - and untidy is a great deal better than a box that undoes what
+        somebody asked it to keep.
+
+        ``into_effect`` is for the keep this box had to finish for itself.
+        After a confirmed trial netplan has already applied the configuration,
+        so there is nothing to do; but a keep settled from a stranded record
+        has no running ``netplan try`` behind it - its terminal died with
+        whatever stopped - so netplan has put its own configuration back and
+        the box is running the old settings under a record that says kept.
+        """
+        data.update({
+            "phase": "kept", "finished_at": self._clock(), "message": message,
+        })
+        # There is nothing left to go back to, so the copy of the old wifi
+        # file - password and all - has no reason to stay on the disk.
+        data.pop("previous", None)
+        recorded = self._save(data)
+        if into_effect and recorded:
+            # Only once the record says "kept", for the same reason the undo
+            # waits: state() is what the page polls every couple of seconds,
+            # and a settle nothing could write down would reconfigure every
+            # interface on the box every time round.
+            note = _put_into_effect()
+            if note:
+                # The two sentences cannot both be true, so this replaces
+                # rather than adds - and the page has a branch for it.
+                data["message"] = KEPT_NOT_IN_EFFECT
+                data["in_effect"] = False
+                self._save(data)
+        return data
 
     def revert(self) -> Dict[str, Any]:
         with _CHANGE:
@@ -496,7 +713,8 @@ class Probation:
         module that ends with a change nobody confirmed still in place.
         """
         self._trier.cancel(data.get("handle"))
-        stuck = self._restore(data.get("previous") or {})
+        previous = data.get("previous") or {}
+        stuck = self._restore(previous)
         data.update({
             "phase": "reverted", "finished_at": self._clock(), "message": message,
         })
@@ -504,15 +722,40 @@ class Probation:
             # Saying the box is back on its old settings when a file would not
             # go back is the same lie in a quieter voice, so it says which one
             # and keeps the way back - it is the only copy of it left.
+            #
+            # And nothing is applied here, deliberately: a file that would not
+            # go back still holds the new configuration, so telling netplan to
+            # apply now would make the untested one the live one. That is the
+            # opposite of an undo.
             data["message"] = (
                 f"This box could not put {', '.join(stuck)} back the way it was. "
                 f"Check the network settings here before relying on them."
             )
-        else:
-            # The way back has been taken, so the copy of the old wifi file
-            # stops being useful and starts being only a password in a file.
-            data.pop("previous", None)
-        self._save(data)
+            self._save(data)
+            return self._public(data)
+
+        # The way back has been taken, so the copy of the old wifi file stops
+        # being useful and starts being only a password in a file.
+        data.pop("previous", None)
+
+        # Written down before the disruptive half, and the disruptive half
+        # only happens if it landed. Nothing takes this change out of the
+        # record except this write, so a box that cannot manage it finds the
+        # same change waiting at the next poll of the page and undoes it
+        # again - and applying netplan every couple of seconds is a box whose
+        # network is down more often than it is up. The files are back either
+        # way, so the worst this costs is a restart.
+        recorded = self._save(data)
+        if previous and recorded:
+            # Every file is back, so what is on the disk is the configuration
+            # this box is supposed to be running - and now it actually runs
+            # it. Only when something really was put back: reconfiguring every
+            # interface to apply a file nothing changed is a cost with nothing
+            # bought.
+            note = _put_into_effect()
+            if note:
+                data["message"] = f"{data['message']} {note}"
+                self._save(data)
         return self._public(data)
 
     def _restore(self, previous: Dict[str, Optional[str]]) -> list:
@@ -533,6 +776,8 @@ class Probation:
 __all__ = [
     "DEFAULT_TIMEOUT",
     "EMPTY_PLAN",
+    "KEPT_NOT_IN_EFFECT",
+    "NOT_IN_EFFECT",
     "STATE_MODE",
     "STATE_NAME",
     "STOP_WAIT",

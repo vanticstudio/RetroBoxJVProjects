@@ -111,6 +111,31 @@ def test_the_clock_is_shown_right_there_in_the_editor(box, sent, monkeypatch):
     assert clock["timezone"] == "UTC"
 
 
+def test_the_schedule_editor_tells_a_drifting_clock_from_a_plainly_wrong_one(
+    box, sent, monkeypatch
+):
+    """Two different faults, and only one of them is worth buying a part for.
+
+    "Nothing is keeping this clock correct" means it will drift. "This box
+    thinks it is 2011" means every daypart is already firing at the wrong hour
+    and the coin cell on the motherboard is flat. The editor is where somebody
+    stares at times that do not match what the television is doing, so it is
+    where the difference has to be visible - not three tabs away under System.
+    """
+    from retrobox import sysinfo, timekeeping
+
+    monkeypatch.setattr(
+        sysinfo, "_run",
+        lambda cmd, **k: "Timezone=UTC\nNTPSynchronized=no\nNTP=no\n" if "show" in cmd else "",
+    )
+    monkeypatch.setattr(timekeeping, "clock_is_plausible", lambda **k: False)
+    client, _, _, _ = box
+    clock = client.get("/api/schedule/2").get_json()["clock"]
+
+    assert clock["plausible"] is False
+    assert clock["sync_summary"], "the editor cannot say when the clock last worked"
+
+
 def test_what_is_on_right_now_is_reported(box, sent):
     client, _, _, _ = box
     client.put("/api/schedule/2", json={"blocks": [
@@ -483,17 +508,57 @@ def test_the_crt_effect_can_be_adjusted(box, sent):
     assert crt.curvature == 0.2 and crt.scanlines is False
 
 
-def test_a_crt_change_says_it_needs_a_restart(box, sent):
+def test_a_crt_change_no_longer_asks_for_a_restart_because_it_is_already_on_screen(
+    box, sent
+):
+    """The picture changes the moment it is saved, so nothing may say otherwise.
+
+    ``player.set_crt`` puts a new shader on the live picture and the reload
+    chain calls it, so a saved curvature reaches the television before the
+    customer has looked up from the phone. This used to answer ``["crt"]`` and
+    the browser toasted a sentence about needing a restart at the exact moment
+    the picture changed - a warning that contradicts what the box does is
+    worse than no warning at all.
+    """
     client, _, _, _ = box
     body = client.post("/api/branding/appearance", json={"curvature": 0.1}).get_json()
-    assert body["restart_required"] == ["crt"]
+    assert body["restart_required"] == []
+    assert "restart" not in body["note"].lower(), body["note"]
+    assert body["note"], "a save that changes the picture still has to say so"
+
+
+def test_the_whole_crt_effect_can_be_read_back_and_changed(box, sent):
+    """Everything the shader is built from, readable and writable, both ways.
+
+    ``vignette`` used to come back from the GET and be refused by the POST,
+    and ``corner_radius`` was neither - so two of the five knobs the shader is
+    generated from could not be reached from the dashboard at all.
+    """
+    client, cfg, _, _ = box
+    crt = client.get("/api/branding").get_json()["crt"]
+    assert set(crt) == {"enabled", "curvature", "scanlines", "scanline_intensity",
+                        "vignette", "corner_radius"}
+
+    res = client.post("/api/branding/appearance", json={
+        "vignette": 0.4, "corner_radius": 0.1,
+        "scanlines": True, "scanline_intensity": 0.3,
+    })
+    assert res.status_code == 200, res.get_json()
+    saved = load_config(cfg).crt
+    assert saved.vignette == 0.4 and saved.corner_radius == 0.1
+    assert saved.scanlines is True and saved.scanline_intensity == 0.3
+
+    back = client.get("/api/branding").get_json()["crt"]
+    assert back["vignette"] == 0.4 and back["corner_radius"] == 0.1
 
 
 @pytest.mark.parametrize(
     "payload",
     [{"curvature": 5}, {"curvature": -1}, {"scanline_intensity": 9},
      {"channel_bug_seconds": 999}, {"guide_seconds": -5}, {"crt_enabled": "yes"},
-     {"scanlines": "on"}, {"nonsense": 1}],
+     {"scanlines": "on"}, {"nonsense": 1},
+     {"vignette": 2}, {"vignette": -0.1}, {"corner_radius": 0.9},
+     {"corner_radius": -1}, {"vignette": "dark"}, {"corner_radius": True}],
 )
 def test_appearance_values_are_bounded(box, sent, payload):
     client, cfg, _, _ = box
@@ -515,3 +580,173 @@ def test_previewing_puts_the_banner_on_the_actual_television(box, sent):
     client, _, _, _ = box
     assert client.post("/api/branding/preview").status_code == 200
     assert sent == ["info"]
+
+
+# ==========================================================================
+# The live picture preview
+#
+# Curvature is a taste setting with no correct value: the only way anybody
+# sets it sensibly is by dragging the slider while watching the television.
+# The television has understood "crt_preview" and "crt_cancel" all along and
+# nothing in the dashboard ever said either word.
+# ==========================================================================
+def test_moving_a_picture_slider_shows_it_on_the_television_without_saving_it(
+    box, sent
+):
+    client, cfg, _, _ = box
+    before = cfg.read_text()
+    res = client.post("/api/branding/preview/picture", json={"curvature": 0.25})
+    assert res.status_code == 200, res.get_json()
+    assert sent == ["crt_preview curvature=0.25"]
+    assert cfg.read_text() == before, "a preview wrote to config.yaml"
+
+
+def test_a_preview_is_spoken_in_words_the_television_actually_parses(box, sent):
+    """The one test that would have caught this being wired to nothing.
+
+    The dashboard writing a line and the television reading it are two files
+    that never meet, so the line goes through the real parser here rather than
+    being compared against a string somebody typed twice.
+    """
+    from retrobox.actions import Action
+    from retrobox.input.web import parse_command
+
+    client, _, _, _ = box
+    res = client.post("/api/branding/preview/picture", json={
+        "crt_enabled": True, "curvature": 0.2, "scanlines": False,
+        "scanline_intensity": 0.3, "vignette": 0.4, "corner_radius": 0.1,
+    })
+    assert res.status_code == 200, res.get_json()
+
+    events = parse_command(sent[0])
+    assert [e.action for e in events] == [Action.CRT_PREVIEW]
+    assert events[0].crt.changes() == {
+        "enabled": True, "curvature": 0.2, "scanlines": False,
+        "scanline_intensity": 0.3, "vignette": 0.4, "corner_radius": 0.1,
+    }
+
+
+def test_a_preview_can_name_just_the_control_that_moved(box, sent):
+    """The television merges a nudge onto what it is already showing.
+
+    The page happens to send all six settings at once, which is one short
+    line either way - but the route must not require that, because requiring
+    it would make a partial preview from anything else silently wrong.
+    """
+    from retrobox.input.web import parse_command
+
+    client, _, _, _ = box
+    client.post("/api/branding/preview/picture", json={"vignette": 0.6})
+    assert parse_command(sent[0])[0].crt.changes() == {"vignette": 0.6}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"curvature": 5}, {"curvature": -1}, {"vignette": -0.1}, {"corner_radius": 0.9},
+     {"scanline_intensity": 9}, {"crt_enabled": "yes"}, {"scanlines": "on"},
+     {"vignette": "dark"}, {"corner_radius": True}, {"nonsense": 1},
+     {"channel_bug_seconds": 6}, {}],
+)
+def test_a_preview_the_box_would_refuse_never_reaches_the_television(
+    box, sent, payload
+):
+    """The socket is unauthenticated too, and it answers a bad line with silence.
+
+    Refusing here means the person looking at the screen is told, instead of
+    watching a slider move and nothing happen.
+    """
+    client, cfg, _, _ = box
+    before = cfg.read_text()
+    assert client.post(
+        "/api/branding/preview/picture", json=payload
+    ).status_code == 400
+    assert sent == []
+    assert cfg.read_text() == before
+
+
+def test_cancelling_a_preview_puts_the_last_saved_picture_back(box, sent):
+    client, cfg, _, _ = box
+    before = cfg.read_text()
+    assert client.post("/api/branding/preview/cancel").status_code == 200
+    assert sent == ["crt_cancel"]
+    assert cfg.read_text() == before
+
+
+def test_the_television_puts_the_picture_back_on_its_own_when_a_browser_vanishes(
+    box, sent
+):
+    """The dashboard's cancel is a courtesy; the box's own timeout is the guarantee.
+
+    A tab closed mid-drag, a phone that went out of range or a socket that
+    dropped tells the box nothing, so silence is the signal. Asserted here
+    because the whole "drag it, walk away, your television is not permanently
+    changed" promise rests on it and it lives in another file.
+    """
+    from retrobox.app import TVApp
+
+    assert 0 < TVApp.CRT_PREVIEW_HOLD_SECONDS <= 60
+
+
+def test_the_picture_sliders_preview_as_they_move_and_again_when_let_go(box, sent):
+    client, _, _, _ = box
+    page = client.get("/dash").get_data(as_text=True)
+    panel = page.split("function drawAppearance")[1].split("\nfunction ")[0]
+
+    assert "/api/branding/preview/picture" in page, (
+        "nothing on the page ever says crt_preview"
+    )
+    assert "oninput" in panel, "the picture only changes once a slider is let go"
+    assert "onpointerup" in panel, (
+        "the value the customer let go on is whatever the throttle last allowed"
+    )
+
+
+def test_the_live_preview_is_throttled_at_the_sending_end(box, sent):
+    """One shader compile per pixel of slider travel, on a two-core Celeron."""
+    client, _, _, _ = box
+    page = client.get("/dash").get_data(as_text=True)
+    every = int(page.split("PREVIEW_EVERY_MS = ")[1].split(";")[0])
+    assert 300 <= every <= 500
+
+
+def test_a_preview_is_held_open_while_somebody_is_looking_at_the_panel(box, sent):
+    """Twenty seconds of silence ends a preview, and looking is not silence.
+
+    Somebody who drags a slider and then watches the television for half a
+    minute would otherwise see the picture snap back to saved while the
+    sliders still showed their value.
+    """
+    from retrobox.app import TVApp
+
+    client, _, _, _ = box
+    page = client.get("/dash").get_data(as_text=True)
+    beat = int(page.split("PREVIEW_HEARTBEAT_MS = ")[1].split(";")[0]) / 1000
+    assert 0 < beat < TVApp.CRT_PREVIEW_HOLD_SECONDS / 2, (
+        "one missed heartbeat must not be enough to lose the preview"
+    )
+    assert "visibilityState" in page, (
+        "a phone that locked its screen keeps the preview alive for ever"
+    )
+
+
+def test_leaving_the_page_mid_drag_puts_the_saved_picture_back(box, sent):
+    client, _, _, _ = box
+    page = client.get("/dash").get_data(as_text=True)
+    assert "/api/branding/preview/cancel" in page
+    assert "pagehide" in page, "a closed tab leaves the television changed"
+
+
+def test_no_button_beside_the_live_sliders_claims_the_picture_is_not_live(box, sent):
+    """SHOW IT ON THE TV said the sliders did nothing until it was pressed.
+
+    They are live now, so that label is a lie about the panel it sits in. The
+    channel banner is the one setting here a slider cannot show, so that is
+    what the button does and what it says.
+    """
+    client, _, _, _ = box
+    page = client.get("/dash").get_data(as_text=True)
+    # The quoted form, so the comment explaining the rename does not count as
+    # the button coming back.
+    assert "'SHOW IT ON THE TV'" not in page
+    assert "'SHOW THE CHANNEL BANNER'" in page
+    assert "'PUT THE SAVED PICTURE BACK'" in page
